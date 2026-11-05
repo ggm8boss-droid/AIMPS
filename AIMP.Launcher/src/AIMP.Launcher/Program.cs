@@ -60,7 +60,8 @@ public static class Program
             provider.GetRequiredService<LauncherSettingsStore>(),
             provider.GetRequiredService<ScaleformBridgeListener>(),
             provider.GetRequiredService<PerformanceIsolationState>(),
-            provider.GetRequiredService<GamePreparationService>()));
+            provider.GetRequiredService<GamePreparationService>(),
+            new SteamRelay(provider.GetRequiredService<LauncherDiagnostics>())));
         services.AddSingleton(provider => new UiPakInstaller(
             provider.GetRequiredService<LauncherDiagnostics>()));
         services.AddSingleton(provider => new GameLaunchCoordinator(

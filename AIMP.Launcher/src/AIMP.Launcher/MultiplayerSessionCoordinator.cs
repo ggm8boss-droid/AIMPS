@@ -430,9 +430,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         LauncherSettingsStore settingsStore,
         ScaleformBridgeListener bridge,
         PerformanceIsolationState performanceIsolation,
-        GamePreparationService? gamePreparation = null)
+        GamePreparationService? gamePreparation = null,
+        SteamRelay? steamRelay = null)
     {
         _gamePreparation = gamePreparation;
+        _steamRelay = steamRelay;
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
         _settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
@@ -454,6 +456,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _controller.ItemSyncPickupProduced += OnNativeItemSyncPickupProduced;
         _controller.ItemSyncSpawnProduced += OnNativeItemSyncSpawnProduced;
         _controller.ThrowableProduced += OnNativeThrowableProduced;
+        InitializeSteamRelay();
     }
 
     internal async Task ApplyPerformanceIsolationModuleAsync(
@@ -847,6 +850,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _diagnostics.Log("Multiplayer", $"Lobby hosted on port {host.BoundPort}. Alien enabled={options.AlienEnabled}.");
         await SendMenuLobbyOpenedAsync("host").ConfigureAwait(false);
         await SendStatusAsync("Lobby created").ConfigureAwait(false);
+        await StartSteamHostingAsync(host).ConfigureAwait(false);
     }
 
     private async Task<LobbyHost> StartHostAsync(LobbyHostOptions options)
@@ -921,12 +925,15 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         EnsureMenuConnectionAvailable();
         await StopNetworkAsync("Joining a direct lobby").ConfigureAwait(false);
         var settings = _settingsStore.Load();
-        var options = new LobbyClientOptions(settings.HostAddress, settings.Port,
+        var endpoint = await ResolveJoinEndpointAsync(settings).ConfigureAwait(false);
+        var options = new LobbyClientOptions(endpoint.Host, endpoint.Port,
             settings.PlayerId, settings.PlayerName, LobbyCompatibility.Create(settings));
-        var client = await LobbyClient.ConnectAsync(options).ConfigureAwait(false);
+        LobbyClient client;
+        try { client = await LobbyClient.ConnectAsync(options).ConfigureAwait(false); }
+        catch { CloseSteamClientTunnels("join failed"); throw; }
         await CompleteMenuJoinAsync(client).ConfigureAwait(false);
         await SendMenuLobbyOpenedAsync("client").ConfigureAwait(false);
-        await SendStatusAsync($"Connected to {settings.HostAddress}:{settings.Port}")
+        await SendStatusAsync($"Connected to {endpoint.Label}")
             .ConfigureAwait(false);
     }
 
@@ -4926,10 +4933,11 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         if (client is not null) DetachClient(client);
     }
 
-    private static async Task DisposeNetworkAsync(LobbyHost? host, LobbyClient? client)
+    private async Task DisposeNetworkAsync(LobbyHost? host, LobbyClient? client)
     {
         if (host is not null) await host.DisposeAsync().ConfigureAwait(false);
         if (client is not null) await client.DisposeAsync().ConfigureAwait(false);
+        if (host is not null || client is not null) await StopSteamRelayAsync().ConfigureAwait(false);
     }
 
     private async Task StopRemoteCharactersBestEffortAsync(IEnumerable<uint> characterBases)

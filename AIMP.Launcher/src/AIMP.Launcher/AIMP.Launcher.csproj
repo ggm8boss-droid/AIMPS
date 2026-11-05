@@ -12,7 +12,14 @@
   <ItemGroup>
     <InternalsVisibleTo Include="AIMP.Protocol.Tests" />
     <PackageReference Include="CathodeLib" Version="0.12.2" />
+    <PackageReference Include="Facepunch.Steamworks" Version="2.3.3" GeneratePathProperty="true" />
     <ProjectReference Include="..\AIMP.Protocol\AIMP.Protocol.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Facepunch.Steamworks ships steam_api64.dll as legacy package content,
+         which PackageReference does not copy. -->
+    <None Include="$(PkgFacepunch_Steamworks)\content\steam_api64.dll"
+          Link="steam_api64.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="Resources\UI\*.GFX">
@@ -21,18 +28,12 @@
     </Content>
   </ItemGroup>
   <Target Name="BuildInjector32" BeforeTargets="Build" Condition="'$(RuntimeIdentifier)' == ''">
-    <MSBuild
-      Projects="..\AIMP.Injector32\AIMP.Injector32.csproj"
-      Targets="Build"
-      Properties="Configuration=$(Configuration);Platform=x86" />
+    <MSBuild Projects="..\AIMP.Injector32\AIMP.Injector32.csproj" Targets="Build" Properties="Configuration=$(Configuration);Platform=x86" />
   </Target>
   <Target Name="CopyInjector32" AfterTargets="Build" Condition="'$(RuntimeIdentifier)' == ''">
     <ItemGroup>
       <InjectorFiles Include="..\AIMP.Injector32\bin\x86\$(Configuration)\net8.0\AIMP.Injector32.*" />
     </ItemGroup>
-    <Copy
-      SourceFiles="@(InjectorFiles)"
-      DestinationFolder="$(OutDir)Injector32"
-      SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(InjectorFiles)" DestinationFolder="$(OutDir)Injector32" SkipUnchangedFiles="true" />
   </Target>
 </Project>
