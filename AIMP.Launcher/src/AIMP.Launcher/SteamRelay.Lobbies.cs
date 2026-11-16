@@ -94,7 +94,13 @@ internal sealed partial class SteamRelay
     {
         if (_hostSocket is null) { lobby.Leave(); return; } // hosting stopped while Steam created it
         _lobby = lobby;
-        _ = visibility == SteamLobbyVisibility.Public ? lobby.SetPublic() : lobby.SetFriendsOnly();
+        // A private Steam lobby is never listed; only invited players can join it.
+        _ = visibility switch
+        {
+            SteamLobbyVisibility.Public => lobby.SetPublic(),
+            SteamLobbyVisibility.Private => lobby.SetPrivate(),
+            _ => lobby.SetFriendsOnly()
+        };
         lobby.SetJoinable(true);
         WriteAdvert(lobby, advert);
         _diagnostics.Log("Steam", $"Steam lobby {lobby.Id.Value} created ({visibility}).");
@@ -378,7 +384,7 @@ internal sealed partial class SteamRelay
 
     // Friends see "aimp" = menu / hosting / joined. While hosting a Friends Only or
     // Public lobby, the Steam "Join Game" connect string and listing details are
-    // published (Private lobbies are solo and never host over Steam).
+    // published (Private lobbies are never listed; friends join them by invite).
     private void ApplyPresence()
     {
         var role = _hostSocket is not null ? "hosting" : _lobby is not null || _clientHostSteamId != 0 ? "joined" : "menu";

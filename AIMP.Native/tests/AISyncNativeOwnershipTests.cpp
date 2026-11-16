@@ -156,6 +156,17 @@ void AlienPossessionDoesNotCancelSpawnPassage() {
     m.Cycle(0xDBB2A0U,75U);CHECK(inspect(false)==OwnershipCheck::Waiting);
     m.Cycle(0xEABF80U,1U);m.Put(m.actor.character+0x2DAU,std::uint8_t{});
     CHECK(inspect(false)==OwnershipCheck::Ready && inspect(true)==OwnershipCheck::Ready);
+    // v517 trace: the spawn Move is already in locomotion-start55 at the first
+    // bind poll. Possession may drain/cancel it; generic movement may not.
+    m.Cycle(0xEABE00U,0x37U);m.Put(m.actor.character+0x2CD8U,1U);
+    CHECK(inspect(false)==OwnershipCheck::Ready && inspect(true)==OwnershipCheck::Waiting);
+    CHECK(m.Inspect(false)==OwnershipCheck::Waiting);
+    m.Put(m.actor.character+0x2CD8U,0U);CHECK(inspect(true)==OwnershipCheck::Ready);
+    // The vent entry that follows remains native-owned, as does a backstage55.
+    m.Cycle(0xEADB58U,18U);CHECK(inspect(false)==OwnershipCheck::Waiting);
+    m.Cycle(0xEABE00U,0x37U);m.Put(m.actor.character+0x2DAU,std::uint8_t{1});
+    CHECK(inspect(false)==OwnershipCheck::Waiting);
+    m.Put(m.actor.character+0x2DAU,std::uint8_t{});
 }
 void ExactNativeExecutionProvenance() {
     Memory m;m.actor.creationSerial=11;

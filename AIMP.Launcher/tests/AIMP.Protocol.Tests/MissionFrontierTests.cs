@@ -167,6 +167,54 @@ internal static class MissionFrontierTests
     // MISSION_SalvageMode1 starts a nested MISSION_ChallengeMap10 instance.
     // Starting a mission is a shared, repeatable milestone; a non-mission
     // target or a Campaign catalogue keeps it local.
+    // ChallengeMap11 shape: Alarm PlayerTriggerBox.on_entered -> LogicOnce ->
+    // LogicDelay.triggered -> Xenomorph_NPC.spawn_npc (AI domain). Only the
+    // most upstream mission output commits; the volume and relay stay local.
+    internal static Task NpcSpawnAsync()
+    {
+        WorldEntityId box = new(9, 1), once = new(9, 2), delay = new(9, 3), alarm = new(9, 4), alien = new(9, 5);
+        WorldEntityDescriptor At(WorldEntityId id, WorldEntityKind kind, WorldDomain domain, string primitive) =>
+            new(id, domain, kind, WorldEntityFlags.RuntimeAddressable, 100, (uint)id.Low, 1, 0,
+                (uint)id.Low, 300, 0, 0, primitive, "");
+        var trigger = Port("trigger");
+        var manifest = Manifest() with
+        {
+            Composites = [new WorldCompositeDescriptor(100, @"DLC\ChallengeMap11\MISSION_ChallengeMap11", WorldDomain.World, false, true)],
+            Entities =
+            [
+                At(box, WorldEntityKind.Function, WorldDomain.World, "PlayerTriggerBox"),
+                At(once, WorldEntityKind.Function, WorldDomain.World, "LogicOnce"),
+                At(delay, WorldEntityKind.Function, WorldDomain.World, "LogicDelay"),
+                At(alarm, WorldEntityKind.Function, WorldDomain.World, "LogicDelay"),
+                At(alien, WorldEntityKind.CompositeInstance, WorldDomain.AI, @"Archetypes\NPCs\Alien\Xenomorph_NPC")
+            ],
+            Connections =
+            [
+                new WorldConnectionDescriptor(box, Port("on_entered"), once, trigger, false),
+                new WorldConnectionDescriptor(once, Port("on_success"), delay, trigger, false),
+                new WorldConnectionDescriptor(delay, Port("triggered"), alarm, trigger, false),
+                new WorldConnectionDescriptor(delay, Port("triggered"), alien, Port("spawn_npc"), false)
+            ]
+        };
+        var roots = MissionSyncFrontierCompiler.Compile(manifest, survival: true);
+        AssertEx.Equal(1, roots.Count);
+        AssertEx.Equal(once, roots[0].Source.EntityId);
+        AssertEx.Equal(Port("on_success"), roots[0].Signal);
+        // A chain that never spawns an NPC is not a milestone.
+        var noSpawn = manifest with { Connections = manifest.Connections.Take(3).ToArray() };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(noSpawn, survival: true).Count);
+        // An unsafe fan-out on the upstream output leaves the relay as the root.
+        var unsafeOnce = manifest with { Connections = manifest.Connections.Append(
+            new WorldConnectionDescriptor(once, Port("on_success"), alarm, Port("position"), true)).ToArray() };
+        var relay = MissionSyncFrontierCompiler.Compile(unsafeOnce, survival: true);
+        AssertEx.Equal(1, relay.Count);
+        AssertEx.Equal(delay, relay[0].Source.EntityId);
+        // Outside a mission graph nothing is replicated.
+        var nonMission = manifest with { Composites = [manifest.Composites[0] with { Name = @"AYZ\Props\Alarm" }] };
+        AssertEx.Equal(0, MissionSyncFrontierCompiler.Compile(nonMission, survival: true).Count);
+        return Task.CompletedTask;
+    }
+
     internal static Task MissionStartAsync()
     {
         WorldEntityId trigger = new(9, 1), mission = new(9, 2);

@@ -856,6 +856,13 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         if(!c.host) {
             if(!active.entered && state!=78U && active.victim.character)
                 static_cast<void>(player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration));
+            // The victim replica is a PlayerSync proxy. AISync shields it from
+            // network locomotion only through the Host stream, whose intake is
+            // fenced while this Alien is pair-busy: 506 re-entered Move/Idle on
+            // it under the presented pair, it never acquired and the Alien
+            // stayed in 78. Hold it from the Host's Started until Clear.
+            if(active.victim.character && (active.presented || active.receipt.phase==Phase::Started))
+                PublishPairedParticipantVictim(active.victim.character,now+kPairedParticipantVictimHoldMs);
             // Donor model (puppet.cpp): each PC runs the Alien's native melee.
             // The Host's retail kill is authoritative; this Alien only plays
             // the same pair locally on its victim replica, once the Host has

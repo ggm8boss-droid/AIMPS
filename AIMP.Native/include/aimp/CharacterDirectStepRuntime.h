@@ -155,6 +155,12 @@ struct HidingFollowStats final {
     std::uint32_t maxPullMm{};
 };
 HidingFollowStats HidingFollowSnapshot() noexcept;
+// Per-session vent-entry visual root compensation counters.
+struct VentVisualStats final {
+    std::uint64_t frames{}, rejected{}, relocations{}, relocationFailures{};
+    std::uint32_t maxOffsetMm{};
+};
+VentVisualStats VentVisualSnapshot() noexcept;
 
 // Called from CharacterManagerUpdate on the engine thread. PRE owns normal
 // follower preparation and native transitions. POST is a reconciliation pass

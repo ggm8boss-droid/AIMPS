@@ -41,17 +41,22 @@ Check PendingSource(const Memory& memory,const LocalParticipant& source,const Pa
 }
 Check Capture(const State& state, Command& command) noexcept {
     const bool player=(state.interactionFlags&InteractionTargetIsParticipant)!=0U;
+    // 101x: which field refused the carrier (516: an unexplained 101 left the
+    // Client Alien standing in front of a player the Host had already killed).
+    const auto refuse=[](std::uint32_t site) noexcept { RefusalSite()=site; return Check::Rejected; };
     if (state.version != State{}.version || state.birth == 0U || state.characterClass == 0U ||
-        (state.entityA == 0U && state.entityB == 0U) || state.revision == 0U ||
-        (state.stateFlags & InteractionValid) == 0U || state.interactionRevision == 0U ||
-        (state.interactionFlags & (InteractionActorIsSource | InteractionPairValid)) !=
-            (InteractionActorIsSource | InteractionPairValid) ||
-        (player?(state.interactionTargetPeer==0U||state.interactionParticipantIncarnation==0U||
-            state.interactionTargetBirth!=0U||state.interactionTargetClass!=0U):
-            (state.interactionTargetPeer!=0U||state.interactionParticipantIncarnation!=0U||state.interactionTargetBirth==0U||
-             state.interactionTargetClass==0U||(state.interactionTargetA==0U&&state.interactionTargetB==0U))) ||
-        state.interactionPairRevision == 0U || state.interactionTransition > 1U ||
-        (state.interactionTransitionFlags & ~0xFFFFU) != 0U) { RefusalSite()=101U; return Check::Rejected; }
+        (state.entityA == 0U && state.entityB == 0U) || state.revision == 0U) return refuse(1011U);
+    if ((state.stateFlags & InteractionValid) == 0U || state.interactionRevision == 0U) return refuse(1012U);
+    if ((state.interactionFlags & (InteractionActorIsSource | InteractionPairValid)) !=
+            (InteractionActorIsSource | InteractionPairValid)) return refuse(1013U);
+    if (player) {
+        if (state.interactionTargetPeer==0U) return refuse(1014U);
+        if (state.interactionParticipantIncarnation==0U) return refuse(1015U);
+        if (state.interactionTargetBirth!=0U||state.interactionTargetClass!=0U) return refuse(1016U);
+    } else if (state.interactionTargetPeer!=0U||state.interactionParticipantIncarnation!=0U||state.interactionTargetBirth==0U||
+             state.interactionTargetClass==0U||(state.interactionTargetA==0U&&state.interactionTargetB==0U)) return refuse(1017U);
+    if (state.interactionPairRevision == 0U) return refuse(1018U);
+    if (state.interactionTransition > 1U || (state.interactionTransitionFlags & ~0xFFFFU) != 0U) return refuse(1019U);
     if (state.interactionTransition == 0U || state.interactionTransitionRevision == 0U) return Check::Waiting;
     command.source = Source(state);
     command.victim = player?Participant{state.interactionTargetPeer,0U,0U,state.interactionParticipantIncarnation,0U}:

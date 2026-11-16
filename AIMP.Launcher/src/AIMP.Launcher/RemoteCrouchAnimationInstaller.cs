@@ -23,13 +23,19 @@ namespace AIMP.Launcher;
 /// AnimationSync: every other first-person alias the representation lacks
 /// (interactions: buttons, generators, terminals, vents, levers, hacking...) is
 /// added to its base table too, so any scripted clip the owner plays can be
-/// replayed by alias on the remote body. Retail aliases are never replaced.
+/// replayed by alias on the remote body. Retail aliases are never replaced:
+/// every shareable player clip is also added under ReplayAlias(alias), which
+/// AnimationSync plays so the body runs the owner's exact clip even where the
+/// representation has its own different clip under that alias.
 /// ANIMATION.PAK is global: the retail file is backed up once and every
 /// installation rebuilds the patched file from that backup.
 /// </summary>
 internal static class RemoteCrouchAnimationInstaller
 {
-    private const int PatchVersion = 8;
+    private const int PatchVersion = 9;
+    // Mirrors AIMP.Native AnimationSync.h ReplayAlias: the representation's
+    // alias for the player's exact clip of a player alias.
+    internal static uint ReplayAlias(uint alias) => alias ^ 0xA1B5C0DEu;
     private const string PlayerClipDbEntry = @"DATA\ANIM_SYS\2554777613_ANIM_CLIP_DB.BIN"; // 1ST_PERSON_RIPLEY
     private const string GlobalClipDbEntry = @"DATA\ANIM_SYS\ANIM_CLIP_DB.BIN";
     private const string CrouchedContext = "CROUCHED";
@@ -286,9 +292,13 @@ internal static class RemoteCrouchAnimationInstaller
         var candidates = new List<(uint Hash, AnimClipDatabase.Clip Clip, uint? Group)>();
         foreach (var (hash, slot) in player.Animations.Keys)
         {
-            if (db.Animations.Contains(hash)) continue;
             var clip = player.Animations.Values[slot];
-            if (SharedSection(entries, global, clip, out var group)) candidates.Add((hash, clip, group));
+            if (!SharedSection(entries, global, clip, out var group)) continue;
+            // The player's exact clip, also where the representation has its
+            // own different clip under the same alias.
+            var replay = ReplayAlias(hash);
+            if (!db.Animations.Contains(replay) && !player.Animations.Contains(replay)) candidates.Add((replay, clip, group));
+            if (!db.Animations.Contains(hash)) candidates.Add((hash, clip, group));
         }
         var refused = new HashSet<uint>();
         foreach (var group in candidates.Select(c => c.Group).OfType<uint>().Distinct())

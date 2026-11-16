@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -38,6 +39,43 @@ inline constexpr std::uint32_t kTriggerInput = 0xD9D0CA29U;
 void ObserveMissionComplete() noexcept;
 // Monotonic count of suppressed local level exits (0 = none yet).
 [[nodiscard]] std::uint64_t LocalLevelExitSequence() noexcept;
+// Spectate (adapted from alien-isolation-coop): after a suppressed local
+// death, the retail follow camera watches a living participant. Left/Right
+// arrows cycle through the others. The Launcher shows the target's name.
+struct SpectateCandidate {
+    std::uint64_t peer{};
+    std::uintptr_t character{};
+};
+struct SpectateContext {
+    std::uintptr_t moduleBase{};
+    std::uintptr_t localPlayer{};
+    std::uint32_t nativeGeneration{};
+    // Living remote participants, ascending peer order.
+    const SpectateCandidate* candidates{};
+    std::size_t candidateCount{};
+    // Another feature (local Alien PvP pilot) owns the camera.
+    bool cameraReserved{};
+};
+// Certified engine thread only, once per CharacterManager update.
+void PumpSpectateOnEngineThread(const SpectateContext& context) noexcept;
+struct SpectateState {
+    std::uint64_t targetPeer{};   // 0 = not spectating
+    std::uint32_t candidates{};   // living players that can be watched
+};
+// Any thread.
+[[nodiscard]] SpectateState SpectateSnapshot() noexcept;
+// Engine thread, CATHODE work-item execute (EntityManager::call_method).
+// True for the player's death fade (TriggerDeath on Health_Damage_Death) and
+// the global death depth-of-field while a living participant can be watched:
+// they would otherwise blacken/blur the spectate view (alien-isolation-coop).
+// While the local player is down (dying in a kill or dead), screen fades to
+// black/white (ScreenFadeOutTo* primitives, any script) are suppressed too.
+// `primitive` is the manifest function type, 0 when unknown.
+[[nodiscard]] bool SuppressDeathPresentation(std::uint32_t method, std::uint32_t entity,
+    std::uint32_t type, std::uint32_t primitive) noexcept;
+// Cheap engine-thread flag refreshed by the spectate pump: the local player is
+// dying or dead and a teammate can be watched (gates registry lookups).
+[[nodiscard]] bool LocalPlayerDown() noexcept;
 // Stop suppressing immediately. HookManager owns restoration/retirement;
 // all detour data remain process-local and alive while its trampoline exists.
 void Shutdown() noexcept;

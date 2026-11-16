@@ -439,10 +439,20 @@ public static class AISyncCodec
             || BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]) == 0 || U32(bytes, 16) == 0
             || U32(bytes, 20) == 0 || BinaryPrimitives.ReadUInt64LittleEndian(bytes[24..]) == 0
             || (U32(bytes, 32) == 0 && U32(bytes, 36) == 0) || !AllowedCharacterClass(U32(bytes, 40))
-            || U32(bytes, 44) == 0 || U32(bytes, 48) is 0 or > 0xFFFF
-            || U32(bytes, 56) is not (1 or 2) || U32(bytes, 60) != 0)
+            || U32(bytes, 44) == 0 || !ValidImpactPayload(U32(bytes, 48), U32(bytes, 52), U32(bytes, 56), U32(bytes, 60)))
             throw new ProtocolException("Invalid AISync client impact.");
     }
+
+    // Channels 1/2 carry HP damage. Channel 3 is the exact zero-damage stimulus
+    // (flame repel): damage 0, 16-bit descriptor, reserved = zone | pellets << 8.
+    private static bool ValidImpactPayload(uint damage, uint descriptor, uint channel, uint reserved) =>
+        channel switch
+        {
+            1 or 2 => damage is > 0 and <= 0xFFFF && reserved == 0,
+            3 => damage == 0 && descriptor <= 0xFFFF && (reserved & 0xFF) < 0x80
+                && (reserved >> 8) is >= 1 and <= 16,
+            _ => false
+        };
 
     public static bool ImpactBelongsTo(ReadOnlySpan<byte> bytes, Guid session, int worldGeneration) =>
         bytes.Length == NativeImpactBytes && session != Guid.Empty && worldGeneration > 0

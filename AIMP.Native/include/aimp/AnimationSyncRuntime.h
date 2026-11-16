@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aimp/AnimationSync.h"
+#include "aimp/AnimationSyncMovementPolicy.h"
 #include "aimp/CharacterIncarnation.h"
 #include <cstdint>
 #include <string>
@@ -43,6 +44,9 @@ void ApplyMasksOnEngineThread() noexcept;
 bool InstallMaskHook(HookManager& hooks, std::uintptr_t moduleBase, std::string& error) noexcept;
 // True while a replicated clip owns the representation (movement must hold).
 [[nodiscard]] bool OwnsMovement(std::uintptr_t character) noexcept;
+// Exact owned cycle only: native body root, FP network follower, or visual locker.
+// Unadmitted/deferred states return None, never freezing normal locomotion.
+[[nodiscard]] MovementPolicy MovementPolicyFor(std::uintptr_t character) noexcept;
 // Our clip is the current cycle: carry the actor along the owner's path.
 [[nodiscard]] bool ClipPlaying(std::uintptr_t character) noexcept;// Keep the actor visible through native locker entry/exit, but allow the
 // occupancy runtime to conceal a settled hidden idle (which may loop).
@@ -54,8 +58,19 @@ bool InstallMaskHook(HookManager& hooks, std::uintptr_t moduleBase, std::string&
 // own model space (Y up, heading 0 = +Z): the final pose's skeleton roots are
 // turned by `yaw` about the Character origin, then moved by `offset`. The
 // Character entity, its physics and AI position stay where retail keeps them.
-bool SetVisualOffset(std::uintptr_t character, bool active, const std::array<float, 3>& offset, float yaw) noexcept;
+// stableRoot=true (native vent only) uses the rig's idle root translation as
+// its visual anchor instead of adding owner motion to a moving native root.
+bool SetVisualOffset(std::uintptr_t character, bool active, const std::array<float, 3>& offset,
+    float yaw, bool stableRoot = false) noexcept;
 [[nodiscard]] std::uint64_t VisualOffsetFrames(std::uintptr_t character) noexcept;
+struct VisualRootStats final {
+    std::uint64_t renderedFrames{}, stableFrames{}, idleReferences{}, liveReferences{};
+    float maxSuppressedRootDeltaY{};
+    std::uint64_t ventGroundFrames{}, ventGroundSkipped{}, ventGroundMapped{};
+    float ventMaxGroundLift{}, ventMaxDepthBeforeGround{}, ventMaxHipDrop{};
+    float ventLastFootY{}, ventIdleFootY{};
+};
+[[nodiscard]] VisualRootStats VisualRootSnapshot(std::uintptr_t character) noexcept;
 // Native clock of an owned locker entry clip, 0..1. Engine thread only.
 [[nodiscard]] bool HidingEntryProgress(std::uintptr_t character, float& progress) noexcept;
 // One of our locker entry/idle/exit clips is the current cycle.

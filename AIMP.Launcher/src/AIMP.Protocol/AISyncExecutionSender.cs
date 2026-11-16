@@ -3,6 +3,7 @@ namespace AIMP.Protocol;
 // A single bounded pump per peer/direction; publishing never awaits a socket.
 internal sealed class AISyncExecutionSender : IAsyncDisposable
 {
+    private const int StallLimitMs = 10_000;
     private sealed record Pending(MessageType Type, byte[] Bytes, long Tick, bool Terminal);
     private readonly object _gate = new();
     private readonly Queue<Pending> _queue = new();
@@ -73,9 +74,13 @@ internal sealed class AISyncExecutionSender : IAsyncDisposable
                     }
                 }
                 if (value is null) continue;
-                if (Environment.TickCount64 - value.Tick > 2000) throw new IOException("AISync execution queue expired.");
+                // A cancelled frame write disposes the whole lobby connection
+                // (ProtocolConnection.SendExecutionAsync). A 2 s bound turned a
+                // transient LAN/Wi-Fi stall into a session disconnect (diag
+                // 075147: 1.4 s send, peer dropped). Match the 10 s peer timeout.
+                if (Environment.TickCount64 - value.Tick > StallLimitMs) throw new IOException("AISync execution queue expired.");
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
-                timeout.CancelAfter(TimeSpan.FromSeconds(2));
+                timeout.CancelAfter(TimeSpan.FromMilliseconds(StallLimitMs));
                 var sentAt = Environment.TickCount64;
                 await _send(value.Type, value.Bytes, timeout.Token).ConfigureAwait(false);
                 lock (_gate) {

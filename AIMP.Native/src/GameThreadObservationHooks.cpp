@@ -314,6 +314,7 @@ void __fastcall CharacterManagerUpdateDetour(
         }
         character_direct_step_runtime::PumpOnEngineThread(
             character_direct_step_runtime::EnginePumpPhase::PostCharacterManager);
+        ai_sync::ReconcileDirectPoseOnEngineThread();
     }
 }
 

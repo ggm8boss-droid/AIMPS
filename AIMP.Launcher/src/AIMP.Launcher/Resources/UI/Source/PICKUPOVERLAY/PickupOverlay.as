@@ -59,8 +59,47 @@ package
          addChild(this.aimp_vent_layer);
       }
 
+      // Spectate banner (adapted from alien-isolation-coop's "SPECTATING <name>").
+      // Refreshed by the Launcher while the local player is dead; a stale
+      // banner hides itself like the vent bar.
+      private var aimp_spectate_layer:Sprite;
+      private var aimp_spectate_at:int = 0;
+
+      private function aimp_hide_spectate() : void
+      {
+         if(this.aimp_spectate_layer != null && this.aimp_spectate_layer.parent != null)
+            this.aimp_spectate_layer.parent.removeChild(this.aimp_spectate_layer);
+         this.aimp_spectate_layer = null;
+      }
+
+      private function aimp_update_spectate(line:String) : void
+      {
+         this.aimp_hide_spectate();this.aimp_spectate_at = getTimer();
+         if(this.aimp_get_bridge_value(line,"active") != "1" || this.aimp_loading_layer != null || this.aimp_round_end_layer != null || this.aimp_mission_wait_layer != null) return;
+         var name:String = this.aimp_get_bridge_value(line,"name");
+         var others:int = int(this.aimp_get_bridge_value(line,"others"));
+         var width:Number = stage != null ? stage.stageWidth : 1280;
+         var height:Number = stage != null ? stage.stageHeight : 720;
+         var top:Number = height * 0.05;
+         var panel:Number = others > 1 ? 112 : 84;
+         this.aimp_spectate_layer = new Sprite();this.aimp_spectate_layer.mouseEnabled = false;this.aimp_spectate_layer.mouseChildren = false;
+         this.aimp_spectate_layer.graphics.beginFill(0,0.6);
+         this.aimp_spectate_layer.graphics.drawRect(width * 0.3,top,width * 0.4,panel);
+         this.aimp_spectate_layer.graphics.endFill();
+         var title:TextField = this.aimp_create_round_end_text("SPECTATING",16,width * 0.4,top + 8);title.x = width * 0.3;
+         this.aimp_spectate_layer.addChild(title);
+         var label:TextField = this.aimp_create_round_end_text(others > 1 ? "<   " + name + "   >" : name,28,width * 0.4,top + 32);label.x = width * 0.3;
+         this.aimp_spectate_layer.addChild(label);
+         if(others > 1)
+         {
+            var hint:TextField = this.aimp_create_round_end_text("Left / Right arrow: switch player",14,width * 0.4,top + 78);hint.x = width * 0.3;
+            this.aimp_spectate_layer.addChild(hint);
+         }
+         addChild(this.aimp_spectate_layer);
+      }
+
       public var pickup_cursor_mc:MovieClip;
-      
+
       public var scriptedMessage_mc:MovieClip;
       
       public var mc_tutorial_message_root:MovieClip;
@@ -717,6 +756,7 @@ package
       private function aimp_on_bridge_frame(param1:Event) : void
       {
          if(this.aimp_vent_layer != null && getTimer() - this.aimp_vent_at > 2000) this.aimp_hide_vents();
+         if(this.aimp_spectate_layer != null && (getTimer() - this.aimp_spectate_at > 2000 || this.aimp_round_end_layer != null || this.aimp_mission_wait_layer != null)) this.aimp_hide_spectate();
          var lineEnd:int = 0;
          var line:String = null;
          var count:int = 0;
@@ -829,6 +869,11 @@ package
          if(param1.indexOf("ALIEN_VENTS|") == 0)
          {
             this.aimp_update_vents(param1);
+            return;
+         }
+         if(param1.indexOf("SPECTATE|") == 0)
+         {
+            this.aimp_update_spectate(param1);
             return;
          }
          if(param1.indexOf("SESSION_LOADING|") == 0)

@@ -40,8 +40,20 @@ internal static class SoloLobbyTests
         AssertEx.True(!host.IsSolo && !host.CanStart, "a multi-slot lobby still waits for a ready client");
     }
 
-    private static LobbyHost CreateHost(int capacity) => new(new LobbyHostOptions(
-        "Solo test", "Ripley", Guid.NewGuid(), 0, capacity, "TestLevel", Compatibility()));
+    // A Private lobby keeps every slot: it starts alone, yet players can still join it.
+    internal static async Task PrivateLobbyAcceptsJoinAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var host = CreateHost(4, allowSoloStart: true);
+        host.Start();
+        AssertEx.True(host.IsSolo && host.CanStart, "an empty Private lobby can start alone");
+        await using var client = await LobbyClient.ConnectAsync(new LobbyClientOptions("127.0.0.1",
+            host.BoundPort, Guid.NewGuid(), "Dallas", Compatibility()), timeout.Token).ConfigureAwait(false);
+        AssertEx.True(!host.IsSolo, "a Private lobby with a player is no longer solo");
+    }
+
+    private static LobbyHost CreateHost(int capacity, bool allowSoloStart = false) => new(new LobbyHostOptions(
+        "Solo test", "Ripley", Guid.NewGuid(), 0, capacity, "TestLevel", Compatibility(), AllowSoloStart: allowSoloStart));
 
     private static CompatibilityInfo Compatibility() => new(ProtocolConstants.Version,
         "test-launcher", "test-dll", new string('A', 64), "test-profile", new string('B', 64));

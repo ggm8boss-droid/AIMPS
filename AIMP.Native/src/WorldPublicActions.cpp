@@ -1315,6 +1315,22 @@ constexpr std::uint8_t kMissionRootKind = 0xFEU;
 #endif
 }
 
+// Entity ID (+0C) and composite type (+10) of the borrowed execution object,
+// the same fields alien-isolation-coop reads from call_method's target.
+bool ReadExecutionIdentity(void* execution, std::uint32_t& entity, std::uint32_t& type) noexcept {
+#if defined(_MSC_VER) && defined(_M_IX86)
+    __try {
+#endif
+        if (execution == nullptr) return false;
+        const auto at = reinterpret_cast<std::uintptr_t>(execution);
+        entity = *reinterpret_cast<const std::uint32_t*>(at + 0x0CU);
+        type = *reinterpret_cast<const std::uint32_t*>(at + 0x10U);
+        return true;
+#if defined(_MSC_VER) && defined(_M_IX86)
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+#endif
+}
+
 // Read one retained WorkItem frame using the retail layout established from the
 // supplied AI.exe. Every frame owns source at +08, optional parent at +0C,
 // MemoryAllocation<char> at +10 and flags at +20. Unlike ROOT v8, v9 does not
@@ -3479,11 +3495,26 @@ std::uint8_t __fastcall WorkExecuteDetour(void* manager, void*, void** target,
                                          void** owner, void** itemHolder) {
     const auto original = reinterpret_cast<WorkExecuteFn>(gExecuteTrampoline.load(std::memory_order_acquire));
     if (original == nullptr) return 0U;
-    auto* registry = gRegistry.load(std::memory_order_acquire);
-    if (registry == nullptr || !registry->RuntimeCaptureReady())
-        return original(manager, target, owner, itemHolder);
     // Retail dereferences this holder immediately (009266BE/00926705).
     void* item = itemHolder == nullptr ? nullptr : *itemHolder;
+    auto* registry = gRegistry.load(std::memory_order_acquire);
+    // Spectate: keep the death fade/DOF off a dead player's screen while a
+    // teammate is alive to be watched (PlayerLifecycle). The manifest function
+    // type is looked up only while the local player is down.
+    {
+        std::uint32_t method{}, entity{}, type{}, primitive{};
+        auto* execution = ExecutionFromShared(ReadWorkHolder(target));
+        if (player_lifecycle::Installed() &&
+            ReadPublicInput(static_cast<const std::uint32_t*>(item), method) &&
+            ReadExecutionIdentity(execution, entity, type)) {
+            if (player_lifecycle::LocalPlayerDown() && registry != nullptr && registry->RuntimeCaptureReady())
+                if (const auto id = registry->IdentifyRuntimeEntity(execution))
+                    primitive = registry->FindWorldEntityPrimitiveType(*id).value_or(0U);
+            if (player_lifecycle::SuppressDeathPresentation(method, entity, type, primitive)) return 0U;
+        }
+    }
+    if (registry == nullptr || !registry->RuntimeCaptureReady())
+        return original(manager, target, owner, itemHolder);
     // Campaign engine actions (including save stations) are authored once in
     // the manifest. Resolve their scheduled input in each peer's own world;
     // never send a station pointer or invoke the UI's checkpoint update call.

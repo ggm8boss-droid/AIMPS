@@ -87,12 +87,17 @@ constexpr float kFollowerHardResyncDistance = 1.50F;
 // AISync can carry faster NPC motion than PlayerSync's human follower. Give
 // native locomotion time to absorb transient drift before an emergency snap.
 constexpr float kAiFollowerMaximumMagnitude = 20.0F;
+// Direct Host-pose locomotion: above the Alien sprint, below noise spikes.
+constexpr float kAiHybridMaximumMagnitude = 10.0F;
 constexpr float kAiFollowerPositionGain = 2.5F;
 constexpr float kAiFollowerMaximumCorrectionSpeed = 4.0F;
 constexpr float kAiFollowerMaximumSettlingMagnitude = 2.5F;
 constexpr float kAiFollowerHardResyncDistance = 3.50F;
 constexpr std::uint64_t kAiFollowerHardResyncGraceMilliseconds = 500U;
 constexpr std::uint64_t kFollowerHardResyncCooldownMilliseconds = 250U;
+// After a native full-body interaction, allow the regular retail follower to
+// converge before its emergency snap logic is eligible again.
+constexpr std::uint64_t kNativeAnimationFollowerGraceMilliseconds = 1500U;
 constexpr std::uint64_t kFollowerHardResyncProbeIntervalMilliseconds = 100U;
 constexpr std::uint64_t kMoveTypeValidationIntervalMilliseconds = 250U;
 constexpr std::uint64_t kIdleValidationIntervalMilliseconds = 250U;
@@ -165,6 +170,8 @@ struct MovementSlot final {
     std::atomic<bool> stopPending{false};
     std::atomic<bool> initialPlacementPending{false};
     std::atomic<bool> hidingOwned{false};
+    std::atomic<bool> nativeAnimationOwned{false};
+    std::atomic<std::uint64_t> nativeAnimationReleasedAt{0U};
     std::atomic<std::uint64_t> hidingResumeAt{0U};
     std::atomic<std::uint64_t> hidingResumeDeadline{0U};
     std::atomic<std::uint32_t> hidingSettleXBits{0U};
@@ -236,6 +243,14 @@ void StoreProbe(MovementSlot& slot, const HybridProbe index, const float value) 
 bool UsesAIHybridReplication(const MovementSlot& slot) noexcept {
     return slot.followerPolicy.load(std::memory_order_acquire) ==
         FollowerPolicy::AIHybridNativeOnly;
+}
+
+bool CanForceReplicatedYaw(const MovementSlot&) noexcept {
+    // 511 left yaw to retail while walking: diag 194257 shows the Client Alien
+    // stuck at yaw 0 while the Host turned to -0.27/1.18/-0.94 (retail only
+    // turns while translating fast), so it slid sideways. The interpolated Host
+    // facing is the only authority for direct locomotion.
+    return true;
 }
 
 bool ReplicationLeaseExpired(const MovementSlot& slot) noexcept {
@@ -690,6 +705,8 @@ void ResetPayload(MovementSlot& slot) noexcept {
     slot.stopPending.store(false, std::memory_order_release);
     slot.initialPlacementPending.store(false, std::memory_order_release);
     slot.hidingOwned.store(false, std::memory_order_release);
+    slot.nativeAnimationOwned.store(false, std::memory_order_release);
+    slot.nativeAnimationReleasedAt.store(0U, std::memory_order_release);
     slot.hidingResumeAt.store(0U, std::memory_order_release);
     slot.hidingResumeDeadline.store(0U, std::memory_order_release);
     slot.idleConverged.store(false, std::memory_order_release);
@@ -797,6 +814,8 @@ void ReleaseSlot(MovementSlot& slot) noexcept {
     slot.aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
     slot.hasReplicatedYaw.store(false, std::memory_order_release);
     slot.applyPhysicalStep.store(false, std::memory_order_release);
+    slot.nativeAnimationOwned.store(false, std::memory_order_release);
+    slot.nativeAnimationReleasedAt.store(0U, std::memory_order_release);
     slot.stopPending.store(false, std::memory_order_release);
     slot.initialPlacementPending.store(false, std::memory_order_release);
     slot.idleConverged.store(false, std::memory_order_release);
@@ -1627,21 +1646,42 @@ bool BuildFollowerDemand(
     demand.planarError = planarError;
 
     if (demand.inputMoving) {
-        if (slot.aiReplicationProfile.load(std::memory_order_acquire) &&
-            !UsesAIHybridReplication(slot) && hasTarget) {
+        // Remote players too (513 diag 182335): the forward-only human policy
+        // capped catch-up at x1.35, the Host replica trailed its player by
+        // >1.5 m (7 teleports in 30 s) and the Alien killed it 3 m away from
+        // the real player, so the Client's kill slid the Alien 6 m.
+        if (hasTarget) {
             // NPC intent is sampled native displacement, rather than human
             // input. Follow the buffered path with bounded positional feedback
             // in both axes; the human forward-only/lateral-blend policy leaves
             // an NPC behind at corners until its emergency resync fires.
+            // Direct AI locomotion uses it too: with the human policy the 511
+            // Client Alien lagged 1.4 m behind a slow Host walk (speed x1.35
+            // max, retail never translated below ~0.8) and never recovered.
             const auto correctionSpeed = std::min(planarError * kAiFollowerPositionGain,
                 kAiFollowerMaximumCorrectionSpeed);
             const auto correctionScale = planarError > kMoveRequestEpsilon ? correctionSpeed / planarError : 0.0F;
             auto velocityX = inputX + errorX * correctionScale;
             auto velocityZ = inputZ + errorZ * correctionScale;
+            const auto aiFollower = slot.aiReplicationProfile.load(std::memory_order_acquire);
+            if (!aiFollower) {
+                // A human proxy never walks backwards while its player moves:
+                // keep at least a quarter of the input speed along its travel.
+                const auto along = (velocityX * inputX + velocityZ * inputZ) / inputMagnitude;
+                const auto minimumAlong = inputMagnitude * 0.25F;
+                if (along < minimumAlong) {
+                    velocityX += inputX / inputMagnitude * (minimumAlong - along);
+                    velocityZ += inputZ / inputMagnitude * (minimumAlong - along);
+                }
+            }
             const auto magnitude = std::hypot(velocityX, velocityZ);
-            if (magnitude > kAiFollowerMaximumMagnitude) {
-                velocityX *= kAiFollowerMaximumMagnitude / magnitude;
-                velocityZ *= kAiFollowerMaximumMagnitude / magnitude;
+            // A 15 m/s Host sample (511, t=7 s) drove magnitude 20 and the
+            // Client Alien stalled in Move for 0.5 s. Keep demands physical.
+            const auto maximum = UsesAIHybridReplication(slot) ? kAiHybridMaximumMagnitude
+                : aiFollower ? kAiFollowerMaximumMagnitude : kFollowerMaximumMagnitude;
+            if (magnitude > maximum) {
+                velocityX *= maximum / magnitude;
+                velocityZ *= maximum / magnitude;
             }
             demand.drive = magnitude > kMoveRequestEpsilon;
             demand.branch = 5U;
@@ -2428,7 +2468,9 @@ bool ArmCore(
     const auto previousPolicy = slot->followerPolicy.exchange(
         followerPolicy, std::memory_order_acq_rel);
     const auto policyChanged = previousPolicy != followerPolicy;
-    if (hybrid || policyChanged) {
+    if (policyChanged) {
+        // Retain prepared native demand across frames in the same AI policy.
+        // Clearing it every frame creates redundant native graph work.
         slot->aiReplicationProfile.store(hybrid, std::memory_order_release);
         slot->initialPlacementPending.store(false, std::memory_order_release);
         slot->aiDivergenceSinceTickMs.store(0U, std::memory_order_release);
@@ -2681,6 +2723,12 @@ struct HidingVisual final {
 };
 std::array<HidingVisual, 40> gHidingVisuals{};
 std::atomic<std::uintptr_t> gHidingVisualLast{};
+// Physical vent traversal is not replicated to the NPC. Correct its rendered
+// root only while the native body clip plays; avoid per-frame teleports.
+std::array<HidingVisual, 40> gVentVisuals{};
+std::atomic<std::uint64_t> gVentVisualFrames{}, gVentVisualRejected{};
+std::atomic<std::uint64_t> gVentVisualRelocations{}, gVentVisualRelocationFailures{};
+std::atomic<std::uint32_t> gVentVisualMaxOffsetMm{};
 HidingVisual* FindHidingVisual(const std::uintptr_t characterAddress, const bool create) noexcept {
     for (auto& visual : gHidingVisuals) if (visual.character == characterAddress) return &visual;
     if (!create) return nullptr;
@@ -2707,6 +2755,57 @@ void ShowHidingPath(const std::uintptr_t characterAddress) noexcept {
     gHidingVisualLast.store(characterAddress);
     if (animation_sync::SetVisualOffset(characterAddress, true, offset, turn))
         gHidingEntryApproachFrames.fetch_add(1U, std::memory_order_relaxed);
+}
+HidingVisual* FindVentVisual(const std::uintptr_t character, const bool create) noexcept {
+    for (auto& v : gVentVisuals) if (v.character == character) return &v;
+    if (!create) return nullptr;
+    for (auto& v : gVentVisuals)
+        if (v.character == 0U) { v = {}; v.character = character; return &v; }
+    return nullptr;
+}
+void ShowVentVisualPath(MovementSlot& slot, const std::uintptr_t character) noexcept {
+    float tx{}, ty{}, tz{}, x{}, y{}, z{}, yaw{};
+    if (!LoadNetworkTarget(slot, tx, ty, tz) ||
+        !ReadTransform(character, x, y, z) ||
+        !ReadReplicatedYaw(character, yaw)) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    const float wx = tx-x, wy = ty-y, wz = tz-z;
+    const float gap = std::sqrt(wx*wx + wy*wy + wz*wz);
+    if (!std::isfinite(gap) || gap > kHidingFollowMaximumGap) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    auto* visual = FindVentVisual(character, true);
+    if (visual == nullptr) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    // Reuse the already verified locker world-to-model convention.
+    const auto c = std::cos(yaw), s = std::sin(yaw);
+    const std::array<float,3> offset{wx*c-wz*s, wy, wz*c+wx*s};
+    const float ownerYaw = slot.hasReplicatedYaw.load(std::memory_order_acquire)
+        ? LoadFloat(slot.replicatedYawBits) : yaw;
+    const float turn = static_cast<float>(std::remainder(ownerYaw-yaw, 6.28318530717958647692F));
+    if (!animation_sync::SetVisualOffset(character, true, offset, turn, true)) {
+        gVentVisualRejected.fetch_add(1U, std::memory_order_relaxed); return;
+    }
+    visual->last = {tx,ty,tz}; visual->lastYaw = ownerYaw;
+    gVentVisualFrames.fetch_add(1U, std::memory_order_relaxed);
+    const auto mm = static_cast<std::uint32_t>(gap * 1000.0F);
+    auto previous = gVentVisualMaxOffsetMm.load(std::memory_order_relaxed);
+    while (mm > previous && !gVentVisualMaxOffsetMm.compare_exchange_weak(
+        previous, mm, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+void FinishVentVisualPath(const std::uintptr_t character) noexcept {
+    auto* visual = FindVentVisual(character, false);
+    if (visual == nullptr) return;
+    // One endpoint placement after native cycle ownership ends. Its physics
+    // outcome remains experimental and is tracked separately.
+    if (ApplyAIRecoveryTransform(character, visual->last.data(), visual->lastYaw))
+        gVentVisualRelocations.fetch_add(1U, std::memory_order_relaxed);
+    else
+        gVentVisualRelocationFailures.fetch_add(1U, std::memory_order_relaxed);
+    static_cast<void>(animation_sync::SetVisualOffset(character, false, {}, 0.0F));
+    *visual = {};
 }
 // The locker sequence is over: put the entity where the body is shown (the
 // owner's real position once out of the prop), then drop the offset.
@@ -2740,10 +2839,31 @@ void PumpSlotOnEngineThread(
         return;
     }
 
-    // A replicated interaction clip owns the representation: no Move/Idle;
-    // the follower re-places it once the clip ends.
-    if (animation_sync::OwnsMovement(characterAddress)) {
-        slot.initialPlacementPending.store(true, std::memory_order_release);
+    // A replicated clip owns this Character. Native full-body clips retain
+    // their own engine root motion and MUST NOT also chase the FP network
+    // path. The FP fallback still follows the network; hiding remains visual.
+    const auto clipPolicy = animation_sync::MovementPolicyFor(characterAddress);
+    if (clipPolicy != animation_sync::MovementPolicy::NativeVentVisual)
+        FinishVentVisualPath(characterAddress);
+    else if (phase == EnginePumpPhase::PostCharacterManager)
+        ShowVentVisualPath(slot, characterAddress);
+    if (clipPolicy == animation_sync::MovementPolicy::NativeRoot ||
+        clipPolicy == animation_sync::MovementPolicy::NativeVentVisual) {
+        slot.nativeAnimationOwned.store(true, std::memory_order_release);
+    } else if (slot.nativeAnimationOwned.exchange(false, std::memory_order_acq_rel)) {
+        slot.nativeAnimationReleasedAt.store(GetTickCount64(), std::memory_order_release);
+        slot.initialPlacementPending.store(false, std::memory_order_release);
+        slot.idleConverged.store(false, std::memory_order_release);
+        slot.preparedTargetRevision.store(0U, std::memory_order_release);
+    }
+    if (clipPolicy != animation_sync::MovementPolicy::None) {
+        // The admission path already placed a native clip at its interaction
+        // anchor. A pending initial-placement teleport would snap it after
+        // the clip ends; natural locomotion must reacquire from its final pose.
+        slot.initialPlacementPending.store(
+            clipPolicy != animation_sync::MovementPolicy::NativeRoot &&
+                clipPolicy != animation_sync::MovementPolicy::NativeVentVisual,
+            std::memory_order_release);
         slot.nativeStateActive.store(false, std::memory_order_release);
         slot.moveActive.store(false, std::memory_order_release);
         slot.driveRequested.store(false, std::memory_order_release);
@@ -2751,7 +2871,7 @@ void PumpSlotOnEngineThread(
         slot.preparedTargetRevision.store(0U, std::memory_order_release);
         // A locker clip shows the owner's recorded path on the body instead.
         if (phase == EnginePumpPhase::PostCharacterManager) {
-            if (!animation_sync::HidingClipOwned(characterAddress) && animation_sync::ClipPlaying(characterAddress))
+            if (animation_sync::FollowNetworkPath(clipPolicy))
                 FollowAnimationClipPath(slot, characterAddress);
         }
         return;
@@ -2914,7 +3034,8 @@ void PumpSlotOnEngineThread(
             // for a converged idle proxy: retail may touch Character orientation.
             // This is now one direct SEH-guarded scalar write, not a
             // VirtualQuery-backed TryWrite plus a second full follower pass.
-            if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+            if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && CanForceReplicatedYaw(slot) &&
+                !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
                 const auto yaw = LoadFloat(slot.replicatedYawBits);
                 if (!WriteReplicatedYaw(characterAddress, yaw)) {
                     slot.protectedFailures.fetch_add(
@@ -2937,7 +3058,8 @@ void PumpSlotOnEngineThread(
         slot.idleConverged.store(false, std::memory_order_release);
     }
 
-    if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
+    if ((!kHybridAnimatedFacing || !UsesAIHybridReplication(slot)) && CanForceReplicatedYaw(slot) &&
+                !hybridLeaseExpired && slot.hasReplicatedYaw.load(std::memory_order_acquire)) {
         const auto yaw = LoadFloat(slot.replicatedYawBits);
         if (!WriteReplicatedYaw(characterAddress, yaw)) {
             slot.protectedFailures.fetch_add(1U, std::memory_order_relaxed);
@@ -2979,7 +3101,10 @@ void PumpSlotOnEngineThread(
     // Emergency divergence correction is still retained, but this call now
     // happens once in the normal PRE pass (or only when POST actually has new
     // work), rather than twice unconditionally per CharacterManager frame.
-    static_cast<void>(ApplyHardNetworkResync(slot, characterAddress));
+    const auto nativeReleasedAt = slot.nativeAnimationReleasedAt.load(std::memory_order_acquire);
+    if (nativeReleasedAt == 0U || GetTickCount64() - nativeReleasedAt >=
+        kNativeAnimationFollowerGraceMilliseconds)
+        static_cast<void>(ApplyHardNetworkResync(slot, characterAddress));
 
     std::uintptr_t cycleAddress = 0U;
     std::uint8_t cycleState = 0U;
@@ -3486,6 +3611,13 @@ bool Install(
 
 bool Installed() noexcept {
     return gInstalled.load(std::memory_order_acquire);
+}
+VentVisualStats VentVisualSnapshot() noexcept {
+    return {gVentVisualFrames.load(std::memory_order_relaxed),
+        gVentVisualRejected.load(std::memory_order_relaxed),
+        gVentVisualRelocations.load(std::memory_order_relaxed),
+        gVentVisualRelocationFailures.load(std::memory_order_relaxed),
+        gVentVisualMaxOffsetMm.load(std::memory_order_relaxed)};
 }
 
 void SetNativeAIIntentObserver(const NativeAIIntentObserver observer) noexcept {

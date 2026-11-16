@@ -188,10 +188,10 @@ public sealed partial class LobbyClient
         AISyncShadowRecovery? recovery = null;
         try
         {
-            if (Environment.TickCount64 - control.ReadyTicks > 2000)
+            if (Environment.TickCount64 - control.ReadyTicks > 10000)
                 throw new TimeoutException("AISync shadow receipt ready age exceeded.");
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
             await _connection.SendShadowAsync(control.Type, control.Bytes, timeout.Token).ConfigureAwait(false);
             lock (_shadowControlLock)
                 if (control.Open == _shadowOpen && !_shadowControlFailed) _shadowControlCount--;

@@ -765,17 +765,25 @@ void LauncherIPC::PublishPlayerLifecycleTraffic() {
         // event; do not replay it to a Launcher that connects later.
         publishedDeathSequence_ = sequence;
         publishedLevelExitSequence_ = levelExit;
+        publishedSpectatePeer_ = 0U;
+        publishedSpectateCandidates_ = 0U;
         return;
     }
-    if (sequence == publishedDeathSequence_ && levelExit == publishedLevelExitSequence_) return;
+    // Spectating only follows a suppressed death, so a state carrying it
+    // always has the death edge the Launcher requires.
+    const auto spectate = sequence != 0U ? player_lifecycle::SpectateSnapshot() : player_lifecycle::SpectateState{};
+    if (sequence == publishedDeathSequence_ && levelExit == publishedLevelExitSequence_ &&
+        spectate.targetPeer == publishedSpectatePeer_ && spectate.candidates == publishedSpectateCandidates_) return;
 
     // Retried every worker tick until queued: the Host needs these exact edges
     // to decide that every participant of the round is dead or finished.
     std::ostringstream json;
-    json << "{\"schemaVersion\":2"
+    json << "{\"schemaVersion\":3"
          << ",\"deathSequence\":" << sequence
          << ",\"localPlayerDead\":" << (sequence != 0U ? "true" : "false")
          << ",\"levelExitSequence\":" << levelExit
+         << ",\"spectatePeer\":" << spectate.targetPeer
+         << ",\"spectateCandidates\":" << spectate.candidates
          << '}';
     if (Queue(
             protocol::MessageType::PlayerLifecycleState,
@@ -784,6 +792,8 @@ void LauncherIPC::PublishPlayerLifecycleTraffic() {
             JsonBytes(json.str()))) {
         publishedDeathSequence_ = sequence;
         publishedLevelExitSequence_ = levelExit;
+        publishedSpectatePeer_ = spectate.targetPeer;
+        publishedSpectateCandidates_ = spectate.candidates;
     }
 }
 

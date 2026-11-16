@@ -101,6 +101,7 @@ internal static class MissionSyncFrontierCompiler
         var admitted = survival ? DirectFrontiers(manifest, entities, true)
             : CampaignFrontiers(manifest, entities);
         if (survival) admitted.AddRange(ProxiedFrontiers(manifest, entities, admitted));
+        if (survival) admitted.AddRange(NpcSpawnFrontiers(manifest, entities));
         var roots = admitted
             .GroupBy(value => (value.Source.EntityId, value.Signal, value.PublicInput, value.ScheduledInput)).Select(group => group.First())
             .OrderBy(value => value.Source.EntityId.High).ThenBy(value => value.Source.EntityId.Low)
@@ -311,6 +312,59 @@ internal static class MissionSyncFrontierCompiler
                 && edges[(value.target!.EntityId, value.Signal)].All(edge => SafeTarget(edge, entities, true)))
             .Select(value => new MissionSyncFrontier(value.target!, value.Signal,
                 value.target!.Kind == WorldEntityKind.CompositeInstance))
+            .ToArray();
+    }
+
+    // A mission graph may create its NPC only when the LOCAL player enters a
+    // trigger volume (ChallengeMap11: Alarm PlayerTriggerBox -> LogicOnce ->
+    // LogicDelay -> Xenomorph_NPC.spawn_npc). Each peer keeps its own volume,
+    // so a Client survivor tripping it never created the Host's authoritative
+    // Alien, and a Host Alien pilot (hidden player) never trips it at all.
+    // Replicate the most upstream safe mission output whose control fan-out
+    // reaches an NPC spawn input; the volume itself stays per-player.
+    private static readonly uint SpawnNpcInput = ShortGuidUtils.Generate("spawn_npc").AsUInt32;
+    private const int SpawnReachDepth = 6;
+
+    private static IEnumerable<MissionSyncFrontier> NpcSpawnFrontiers(WorldManifest manifest,
+        IReadOnlyDictionary<WorldEntityId, WorldEntityDescriptor> entities)
+    {
+        var composites = manifest.Composites.ToDictionary(value => value.CompositeShortGuid);
+        var sources = MissionSources(manifest, true);
+        var outgoing = manifest.Connections.ToLookup(edge => edge.SourceEntity);
+        bool SpawnSink(WorldConnectionDescriptor edge) => edge.TargetParameter == SpawnNpcInput
+            && entities.TryGetValue(edge.TargetEntity, out var target)
+            && target.Kind == WorldEntityKind.CompositeInstance
+            && target.Domain is WorldDomain.AI or WorldDomain.World;
+        // Entities reached through control flow (logic relays only, never into
+        // another composite's internals) and whether an NPC spawn is reached.
+        (HashSet<WorldEntityId> Reached, bool Spawns) Reach(IEnumerable<WorldConnectionDescriptor> first)
+        {
+            var reached = new HashSet<WorldEntityId>();
+            var frontier = first.ToList();
+            for (var depth = 0; depth < SpawnReachDepth && frontier.Count != 0; ++depth)
+            {
+                if (frontier.Any(SpawnSink)) return (reached, true);
+                frontier = frontier.Where(edge => reached.Add(edge.TargetEntity)
+                        && entities.TryGetValue(edge.TargetEntity, out var target)
+                        && target.Kind is WorldEntityKind.Function or WorldEntityKind.Proxy)
+                    .SelectMany(edge => outgoing[edge.TargetEntity]).ToList();
+            }
+            return (reached, false);
+        }
+        var candidates = manifest.Connections.GroupBy(edge => (edge.SourceEntity, edge.SourceParameter))
+            .Where(group => group.Key.SourceParameter != 0U
+                && sources.TryGetValue(group.Key.SourceEntity, out var source)
+                && composites.TryGetValue(source.SourceCompositeShortGuid, out var composite)
+                && IsMissionGraph(composite.Name)
+                && !SurvivalLocalInteractionPorts.Contains(group.Key.SourceParameter)
+                && group.All(edge => SpawnSink(edge) || SafeTarget(edge, entities, true)))
+            .Select(group => (group.Key, Reach: Reach(group)))
+            .Where(value => value.Reach.Spawns).ToArray();
+        // Only the most upstream output commits: a downstream relay of the same
+        // chain re-emits during the replay and must stay a local consequence.
+        return candidates.Where(value => !candidates.Any(other => other.Key != value.Key
+                && other.Reach.Reached.Contains(value.Key.SourceEntity)))
+            .Select(value => new MissionSyncFrontier(sources[value.Key.SourceEntity], value.Key.SourceParameter))
             .ToArray();
     }
 

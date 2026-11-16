@@ -334,7 +334,7 @@ package frontend
          this._voiceVolumeItem = new MenuItem("Voice volume",this.voiceVolumeChanged);
          this._developerItem = new MenuItem("Developer mode: Off",this.developerToggle);
          this._developerItem.visible = false;
-         this._developerItem.description = "Experimental game mode and level selection. Campaign levels require game preparation after restarting the game.";
+         this._developerItem.description = "Unlocks the Campaign game mode and level selection. Campaign levels are prepared after restarting the game.";
          this._voicePage.page.addItem(this._developerItem);
          this._voicePage.page.addItem(this._voiceEnabledItem);
          this._voicePage.page.addItem(this._voiceModeItem);
@@ -543,7 +543,7 @@ package frontend
          this._survivorMapIds = ["survival_auto"];
          this._survivorMapLabels = ["Auto Survivor Map"];
          this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
-         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival","campaign"],["Survival","Campaign"],this.serverModeChangedHandler);
+         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival"],["Survival"],this.serverModeChangedHandler);
          this._campaignSaveItem = new MenuItemOptionOptionStepper("Campaign save",[0],["New campaign"],this.campaignSaveChangedHandler);
          this._serverMapItem = new MenuItemOptionOptionStepper("Survivor Map",this._survivorMapIds,this._survivorMapLabels,this.serverMapChangedHandler);
          this._serverPvPItem = new MenuItemOptionOptionStepper("Match Type",["coop","pvp"],["Co-op","Alien vs Survivors"],this.serverPvPChangedHandler);
@@ -1068,6 +1068,24 @@ package frontend
       {
          this.refreshSurvivorMapOptions();
       }
+
+      // Campaign is a Developer mode game mode. Without it, Survival (Co-op or
+      // Alien vs Survivors through Match Type) is the only choice.
+      private function refreshServerModeOptions() : void
+      {
+         var campaign:Boolean = this._developerMode && this._serverModeItem.selectedItem != null && String(this._serverModeItem.selectedItem) == "campaign";
+         if(this._developerMode)
+         {
+            this._serverModeItem.setItems(["survival","campaign"],["Survival","Campaign"]);
+            this._serverModeItem.descriptions = ["Create a survival server","Start a new campaign or continue a host save"];
+         }
+         else
+         {
+            this._serverModeItem.setItems(["survival"],["Survival"]);
+            this._serverModeItem.descriptions = ["Create a survival server"];
+         }
+         this._serverModeItem.selectedIndex = campaign ? 1 : 0;
+      }
       
       private function campaignSaveChangedHandler(event:MenuItemEvent) : void
       {
@@ -1387,15 +1405,14 @@ package frontend
       {
          if(this._mpLobbyRole != "" || !this.mpBeginCommand("create")) return;
          this._mpCreatedVisibility = String(this._serverVisibilityItem.selectedItem);
-         this.show_network_notification(this._mpCreatedVisibility == "private" ? "Creating solo lobby" : "Creating lobby");
+         this.show_network_notification("Creating lobby");
          var pvp:Boolean = this.serverPvPSelected();
          this._mpBridge.createLobby(String(this._serverModeItem.selectedItem),int(this._serverMaxPlayersItem.selectedItem),String(this._serverVisibilityItem.selectedItem),this.getSelectedSurvivorMapId(),this.getSelectedSurvivorMapName(),String(this._serverAlienItem.selectedItem) != "0" || pvp,pvp,String(this.getCampaignChoice().action),String(this.getCampaignChoice().id),"medium");
       }
 
-      // Alien vs Survivors needs 2+ players, so a Private (solo) lobby is always Co-op.
       private function serverPvPSelected() : Boolean
       {
-         return String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign" && String(this._serverVisibilityItem.selectedItem) != "private";
+         return String(this._serverPvPItem.selectedItem) == "pvp" && String(this._serverModeItem.selectedItem) != "campaign";
       }
       
       private function readyChangedHandler(param1:MenuItemEvent) : void
@@ -1496,6 +1513,7 @@ package frontend
             if(level.toUpperCase().indexOf("CHALLENGE") != 0 && level.toUpperCase().indexOf("BSPNOSTROMO_") != 0 && level.toUpperCase().indexOf("SALVAGE") != 0)
                this._campaignLevelIds.push(level);
          }
+         this.refreshServerModeOptions();
          this.refreshCampaignSaveOptions(param1);
          this.refreshSurvivorMapOptions();
          this.mpRefreshServerConfigItems();
@@ -1602,8 +1620,6 @@ package frontend
          this._serverRefreshItem.enabled = idle && outsideLobby;
          this._friendsItem.enabled = this._mpLauncherReady;
          this._friendsRefreshItem.enabled = this._mpLauncherReady;
-         // Invites are sent only from inside a lobby; a Private (solo) lobby has no slot to invite into.
-         this._hostInviteItem.visible = this._mpCreatedVisibility != "private";
          this._hostInviteItem.enabled = this._mpLauncherReady && this._mpLobbyRole == "host";
          this._clientInviteItem.enabled = this._mpLauncherReady && this._mpLobbyRole == "client";
          this._friendJoinItem.enabled = idle && outsideLobby && this._mpSelectedFriendCanJoin;
@@ -1943,8 +1959,7 @@ package frontend
          if(this._serverMapItem != null && this._serverModeItem != null)
          {
             this._serverModeItem.visible = true;
-            // Private lobbies are solo, so Match Type (Alien vs Survivors) is hidden and Co-op is used.
-            this._serverPvPItem.visible = String(this._serverModeItem.selectedItem) != "campaign" && (this._serverVisibilityItem == null || String(this._serverVisibilityItem.selectedItem) != "private");
+            this._serverPvPItem.visible = String(this._serverModeItem.selectedItem) != "campaign";
             this._serverAlienItem.visible = String(this._serverPvPItem.selectedItem) != "pvp" || !this._serverPvPItem.visible;
             this._campaignSaveItem.visible = String(this._serverModeItem.selectedItem) == "campaign";
             this._serverMapItem.visible = this._developerMode && (!this._campaignSaveItem.visible || this.getCampaignChoice().action == "level");
@@ -2571,12 +2586,12 @@ package frontend
          this._serverNameItem.enabled = false;
          this._serverPasswordItem.visible = false;
          this._serverPasswordItem.description = "Configured in the launcher settings";
-         this._serverModeItem.descriptions = ["Create a survival server","Start a new campaign or continue a host save"];
+         this._serverModeItem.descriptions = ["Create a survival server"];
          this._campaignSaveItem.description = "Start a new campaign on Medium or continue a save provided by the launcher";
          this._serverMapItem.descriptions = this._survivorMapDescriptions;
          this._serverAlienItem.descriptions = ["Normal Alien behavior","Disable the Alien to explore and test this level"];
          this._serverMaxPlayersItem.descriptions = ["Two player MVP","Three players experimental","Four players experimental"];
-         this._serverVisibilityItem.descriptions = ["Solo - start right away, nobody else can join","Shown in your Steam friends' server browser","Shown in everyone's server browser"];
+         this._serverVisibilityItem.descriptions = ["Not listed - friends join by invite or direct IP; you can start alone","Shown in your Steam friends' server browser","Shown in everyone's server browser"];
          this._serverStartItem.description = "Create lobby and wait for players";
          this._serverRefreshItem.description = "Refresh the server list";
          this._serverFilterItem.descriptions = ["Show every server","Show campaign servers","Show survival servers"];
@@ -2595,10 +2610,10 @@ package frontend
          this._clientLobbyPlayer2Item.enabled = false;
          this._hostLobbyPlayer1Item.description = "Local owner slot";
          this._hostLobbyPlayer2Item.description = "Remote player slot";
-         this._hostLobbyPlayer3Item.description = "Future player slot";
+         this._hostLobbyPlayer3Item.description = "Remote player slot";
          this._hostLobbyPlayer4Item.description = "Remote player slot";
-         this._hostLobbyPlayer3Item.visible = false;
-         this._hostLobbyPlayer4Item.visible = false;
+         this._hostLobbyPlayer3Item.visible = true;
+         this._hostLobbyPlayer4Item.visible = true;
          this._hostLobbyKick3Item.visible = false;
          this._hostLobbyKick4Item.visible = false;
          this._hostLobbyKick2Item.description = "Remove the other player from this lobby";

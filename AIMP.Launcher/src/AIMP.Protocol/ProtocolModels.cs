@@ -331,7 +331,9 @@ public sealed record NativePlayerLifecycleStatePayload(
     int SchemaVersion,
     ulong DeathSequence,
     bool LocalPlayerDead,
-    ulong LevelExitSequence = 0);
+    ulong LevelExitSequence = 0,
+    ulong SpectatePeer = 0,
+    int SpectateCandidates = 0);
 
 public sealed record NativeItemSyncPickupPayload(
     int SchemaVersion,

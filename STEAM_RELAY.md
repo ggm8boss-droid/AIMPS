@@ -47,16 +47,15 @@ Menu: `Resources/UI/Source/NEWFRONTENDMENU/frontend/*.as`, compiled into
 
 | Visibility | Who sees it in the Server Browser | How others join |
 | --- | --- | --- |
-| Private | Nobody | Nobody: it is a solo lobby (see below) |
+| Private | Nobody | Steam friends by invite (Invite Friends), or anyone by direct IP |
 | Friends Only | Your Steam friends | Steam friends only: browser, Friends page, invite, Join Game |
 | Public | Everyone running this build | Anyone: browser, Friends page, invite, Join Game |
 
-**Private = solo.** The lobby has a single slot (you), so **Start Game** works right
-away without waiting for anyone. It is not advertised on Steam, does not accept Steam
-relay connections, and a direct-IP join is refused with "The lobby is full". Match
-Type is hidden and the lobby is always Co-op (Alien vs Survivors needs 2+ players).
-WorldSync is skipped for solo rounds. To play with others, create a Friends Only or
-Public lobby.
+**Private = not listed.** The lobby keeps its 4 slots but is never shown in a server
+browser (it is a private Steam lobby). Friends join it through **Invite Friends**, and
+anyone can still join by direct IP. While nobody has joined, the host can press
+**Start Game** right away and play solo (WorldSync is skipped for a solo round). Match
+Type stays available: a solo Alien vs Survivors lobby lets the host play the Alien.
 
 SteamIDs are public, so for Friends Only the host's relay only accepts connections from
 the host's Steam friends (others are rejected and logged as
@@ -75,8 +74,8 @@ join first. At the top, **Accept Invite: <name>** rows show in-game invites you 
 when that friend hosts a Friends Only / Public lobby). Inviting is not done here.
 
 **Invite Friends** (inside the lobby page, for the host and for joined players): lists
-your online Steam friends; pick one to send an invite to the lobby you are in. It is
-hidden in a Private (solo) lobby. With a Steam lobby the friend gets an in-game
+your online Steam friends; pick one to send an invite to the lobby you are in. With a
+Steam lobby the friend gets an in-game
 **Accept Invite** row plus a Steam chat invite; a player who joined through a Steam
 **Join Game** / invite (no Steam lobby) sends a Steam game invite with the host's
 address instead, which joins automatically when accepted. For a Friends Only lobby the
@@ -114,7 +113,7 @@ Account details shows "Steam ID".
 
 1. Start Steam, then the AI-MP launcher, then the game from the launcher.
 2. Multiplayer → Create Server → set **Visibility** to **Friends Only** or **Public**
-   (Private is solo), then **Create Lobby**. The status line shows
+   (or **Private** and invite B), then **Create Lobby**. The status line shows
    `Lobby created (listed for friends) - Invite Friends or share steam:<A's id>`.
 3. In the lobby page → **Invite Friends** → pick B. (Or in the Steam friends list
    right-click B → **Invite to Game**.)
@@ -146,6 +145,7 @@ Account details shows "Steam ID".
 - Leaving the lobby logs `Left Steam lobby` and `Relay tunnel ... closed` on both sides.
 - Solo check: create a **Private** lobby and press **Start Game** right away; the
   round should load without waiting, and dying should return you to the lobby.
+- Private check: create a **Private** lobby; B joins by invite or direct IP.
 
 ## Troubleshooting
 
@@ -153,9 +153,8 @@ Account details shows "Steam ID".
 | --- | --- |
 | `Steam relay unavailable` in log | Steam not running or not signed in when the game menu became ready. Start Steam; the launcher retries every 10 s after menu activation. |
 | Friends page says "No friends online" | Steam is not running/signed in, or none of your friends are online. |
-| Friend's lobby isn't in the browser | It is Private (solo, nobody can join), the friend runs a different build, or the game already started. |
-| No **Invite Friends** in the lobby | The lobby is Private (solo). Create a Friends Only or Public lobby. |
-| `The lobby is full` when joining | The host created a Private (solo) lobby. Ask them to create a Friends Only or Public lobby. |
+| Friend's lobby isn't in the browser | It is Private (ask for an invite), the friend runs a different build, or the game already started. |
+| `The lobby is full` when joining | The lobby already has 4 players. |
 | `That lobby runs a different AIMP version` | Both players need the same build. |
 | Host log: `Rejected Steam relay peer ...: not a Steam friend` | The lobby is Friends Only and that player isn't the host's Steam friend. Add them as a friend or make the lobby Public. |
 | Log: `Rejected a command connection that is not from the game` | Something other than the game (for example a web page) tried to send commands to the launcher's UI bridge. It was ignored. |

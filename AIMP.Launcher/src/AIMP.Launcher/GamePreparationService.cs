@@ -46,7 +46,8 @@ public sealed class GamePreparationService
     {
         lock (_sync)
         {
-            var game = GameInstallation.Resolve(_settings.Load().GameDirectory);
+            var settings = _settings.Load();
+            var game = GameInstallation.Resolve(settings.GameDirectory);
             if (!_job.IsCompleted)
             {
                 if (!SameDirectory(game.GameDirectory, _status.GameDirectory))
@@ -65,7 +66,8 @@ public sealed class GamePreparationService
             _jobCancel?.Dispose();
             _jobCancel = CancellationTokenSource.CreateLinkedTokenSource(_shutdown);
             var token = _jobCancel.Token;
-            _job = Task.Run(() => Run(game.GameDirectory, id, token), CancellationToken.None);
+            var includeCampaign = settings.DeveloperMode;
+            _job = Task.Run(() => Run(game.GameDirectory, includeCampaign, id, token), CancellationToken.None);
             return _status;
         }
     }
@@ -183,9 +185,12 @@ public sealed class GamePreparationService
                     throw new InvalidOperationException("Prepare this installation in the Launcher before starting a multiplayer game.");
                 receipt = _receipt;
             }
-            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level, settings.DeveloperMode || allowCampaign);
+            // Campaign levels are prepared only in Developer mode (see Run).
+            if (allowCampaign && !settings.DeveloperMode)
+                throw new InvalidOperationException(MultiplayerSessionCoordinator.CampaignDisabledMessage);
+            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level, settings.DeveloperMode);
             var entry = receipt.Manifests.SingleOrDefault(m => SameDirectory(source, m.LevelDirectory));
-            if (entry == null && (settings.DeveloperMode || allowCampaign))
+            if (entry == null && settings.DeveloperMode)
                 return LoadDeveloperManifest(source, cancellationToken);
             if (entry == null)
                 throw new InvalidOperationException("This level has no prepared world manifest. Close the game and prepare this map individually in Debug > WorldManifest, then relaunch.");
@@ -226,7 +231,9 @@ public sealed class GamePreparationService
         return prepared;
     }
 
-    private void Run(string game, string jobId, CancellationToken token)
+    // Survival levels (DLC) are always prepared. Campaign levels are prepared only
+    // in Developer mode, the only mode that can host a campaign lobby.
+    private void Run(string game, bool includeCampaign, string jobId, CancellationToken token)
     {
         try
         {
@@ -234,7 +241,7 @@ public sealed class GamePreparationService
             {
                 token.ThrowIfCancellationRequested();
                 AssertGameStopped();
-                var levels = WorldManifestLevelDiscovery.Discover(game, includeCampaign: true).Where(l => l.CanCompile).ToArray();
+                var levels = WorldManifestLevelDiscovery.Discover(game, includeCampaign).Where(l => l.CanCompile).ToArray();
                 if (levels.Length == 0) throw new InvalidDataException("No playable levels were found.");
                 // Global, not level-bound: verified (and re-applied after a game
                 // file repair) on every preparation, even with a valid receipt.
@@ -245,13 +252,7 @@ public sealed class GamePreparationService
                 token.ThrowIfCancellationRequested();
                 var receiptPath = ReceiptPath(game);
                 var existing = TryReadReceipt(receiptPath);
-                if (existing != null && existing.RecipeVersion == RecipeVersion
-                    && existing.CompilerVersion == WorldManifestConstants.CompilerVersion
-                    && SameDirectory(existing.GameDirectory, game)
-                    && existing.Manifests.Length == levels.Length
-                    && existing.Manifests.All(m => levels.Any(l => SameDirectory(l.LevelDirectory, m.LevelDirectory)))
-                    && StampsEqual(existing.Files, CaptureStamps(game, levels, existing.Manifests),
-                        Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK")))
+                if (existing != null && ReceiptCovers(game, existing, levels))
                 {
                     Complete(existing);
                     return;
@@ -261,14 +262,12 @@ public sealed class GamePreparationService
                     (legacyManifests > 0 ? $" ({legacyManifests} old manifests removed from AppData)." : "."));
                 Update("Character", 2, 0, levels.Length, string.Empty, "Preparing multiplayer characters");
                 var timer = Stopwatch.StartNew();
-                // Every discovered campaign level receives a manifest below.
-                // The previous default includeCampaign=false omitted E_RIPLEY
-                // and its DisplayModel dependencies from those same levels.
-                // The native Spawn130 receiver still acknowledged the request,
-                // but no remote Character was ever materialized.
+                // Characters and manifests cover the same levels: a level with a
+                // manifest but without E_RIPLEY and its DisplayModel dependencies
+                // acknowledges Spawn130 but never materializes a remote Character.
                 RipleyCharacterInstaller.Install(game, new InlineProgress<RipleyInstallProgress>(p =>
                     Update("Character", 2 + (int)(38L * p.CompletedLevels / Math.Max(1, p.TotalLevels)),
-                        p.CompletedLevels, p.TotalLevels, p.Level, p.Message)), token, includeCampaign: true);
+                        p.CompletedLevels, p.TotalLevels, p.Level, p.Message)), token, includeCampaign);
                 // The character step held every level's assets; return that memory
                 // before sizing the manifest workers on the free physical memory.
                 GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
@@ -330,6 +329,24 @@ public sealed class GamePreparationService
                 CompletedAtUtc = DateTimeOffset.UtcNow
             };
         }
+    }
+
+    // A receipt may cover more levels than requested: one prepared in Developer
+    // mode (with the campaign) stays valid for Survival only. Its stamps are
+    // checked over its own levels.
+    private static bool ReceiptCovers(string game, PreparationReceipt receipt,
+        IReadOnlyList<WorldManifestLevelSource> levels)
+    {
+        if (receipt.RecipeVersion != RecipeVersion || receipt.CompilerVersion != WorldManifestConstants.CompilerVersion
+            || !SameDirectory(receipt.GameDirectory, game)
+            || !levels.All(l => receipt.Manifests.Any(m => SameDirectory(l.LevelDirectory, m.LevelDirectory))))
+            return false;
+        var prepared = levels.Count == receipt.Manifests.Length ? levels
+            : WorldManifestLevelDiscovery.Discover(game, includeCampaign: true).Where(l => l.CanCompile)
+                .Where(l => receipt.Manifests.Any(m => SameDirectory(l.LevelDirectory, m.LevelDirectory))).ToArray();
+        return prepared.Count == receipt.Manifests.Length
+            && StampsEqual(receipt.Files, CaptureStamps(game, prepared, receipt.Manifests),
+                Path.Combine(game, "DATA", "GLOBAL", "ANIMATION.PAK"));
     }
 
     private void Complete(PreparationReceipt receipt)

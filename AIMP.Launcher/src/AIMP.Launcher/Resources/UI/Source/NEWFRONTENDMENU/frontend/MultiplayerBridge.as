@@ -303,7 +303,7 @@ package frontend
          this._lastConnectionError = "";
          this._connecting = false;
          this._connected = true;
-         this.invokeStatus("Bridge connected");
+         this.invokeStatus("Waiting for the launcher, please wait...");
          this.send("HELLO",{
             "client":"gfx",
             "version":PROTOCOL_VERSION

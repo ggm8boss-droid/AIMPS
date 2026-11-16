@@ -5817,6 +5817,14 @@ void ObserveTypedInteractionPairCandidate(
     case 0x00200034U:
     case 0x00200036U:
     case 0x00200037U:
+    // Trigger-volume occupancy (Box/PlayerTriggerBox/Sphere -> Character):
+    // 0x01000000 entered, 0x02000000 exited. The player Character has the same
+    // WorldEntityId on every peer, so a replay moved the receiver's OWN player
+    // in/out of the sender's volume (ChallengeMap11 lift climb-out: the Host's
+    // exit fired the Client's on_exited -> Use.disable_use and removed its
+    // prompt). Each peer's physics produces its own occupancy.
+    case 0x01000000U:
+    case 0x02000000U:
         return true;
     default:
         return false;
@@ -5843,6 +5851,8 @@ static_assert(ReceiverLocalInteractionControlMessage(0x00000044U));
 static_assert(ReceiverLocalInteractionControlMessage(0x00100001U));
 static_assert(!ReceiverLocalInteractionControlMessage(0x00000041U));
 static_assert(!ReceiverLocalInteractionControlMessage(0x00000053U));
+static_assert(ReceiverLocalInteractionControlMessage(0x01000000U));
+static_assert(ReceiverLocalInteractionControlMessage(0x02000000U));
 
 void __fastcall QueueTypedMessageDetour(
     void* manager,

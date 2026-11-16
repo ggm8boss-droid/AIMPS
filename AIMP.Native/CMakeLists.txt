@@ -23,6 +23,7 @@ set(AIMP_CORE_SOURCES
     src/VoiceSync.cpp
     src/VoiceNativeAudio.cpp
     src/AISync.cpp
+    src/AISyncHybridMotion.cpp
     src/AlienPvPControlRuntime.cpp
     src/AlienPvPLocalController.cpp
     src/AlienPvPInputIsolation.cpp
@@ -411,6 +412,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.PlayerTorchRuntimeTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME PlayerTorchRuntime COMMAND AIMP.PlayerTorchRuntimeTests)
+    add_executable(AIMP.PlayerSpectatePolicyTests tests/PlayerSpectatePolicyTests.cpp)
+    target_include_directories(AIMP.PlayerSpectatePolicyTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.PlayerSpectatePolicyTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.PlayerSpectatePolicyTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME PlayerSpectatePolicy COMMAND AIMP.PlayerSpectatePolicyTests)
     add_executable(AIMP.PlayerHidingRuntimeTests tests/PlayerHidingRuntimeTests.cpp)
     target_link_libraries(AIMP.PlayerHidingRuntimeTests PRIVATE AIMP.Core)
     target_include_directories(AIMP.PlayerHidingRuntimeTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -456,6 +463,30 @@ if(BUILD_TESTING)
     target_compile_options(AIMP.AISyncTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
     add_test(NAME AISyncOwnershipAndNavigation COMMAND AIMP.AISyncTests
         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/aisync-participant-config-v3.hex")
+    add_executable(AIMP.AnimationSyncTimelineTests tests/AnimationSyncTimelineTests.cpp)
+    target_include_directories(AIMP.AnimationSyncTimelineTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AnimationSyncTimelineTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncTimelineTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncNativeTimeline COMMAND AIMP.AnimationSyncTimelineTests)
+    add_executable(AIMP.AnimationSyncVentGroundTests tests/AnimationSyncVentGroundTests.cpp)
+    target_include_directories(AIMP.AnimationSyncVentGroundTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AnimationSyncVentGroundTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncVentGroundTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncVentGround COMMAND AIMP.AnimationSyncVentGroundTests)
+    add_executable(AIMP.AnimationSyncVisualRootTests tests/AnimationSyncVisualRootTests.cpp)
+    target_include_directories(AIMP.AnimationSyncVisualRootTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AnimationSyncVisualRootTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncVisualRootTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncVisualRoot COMMAND AIMP.AnimationSyncVisualRootTests)
+    add_executable(AIMP.AnimationSyncMovementPolicyTests tests/AnimationSyncMovementPolicyTests.cpp)
+    target_include_directories(AIMP.AnimationSyncMovementPolicyTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_options(AIMP.AnimationSyncMovementPolicyTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AnimationSyncMovementPolicyTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AnimationSyncMovementPolicy COMMAND AIMP.AnimationSyncMovementPolicyTests)
     add_executable(AIMP.AnimationSyncPropsHookTests tests/AnimationSyncPropsHookTests.cpp)
     target_link_libraries(AIMP.AnimationSyncPropsHookTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.AnimationSyncPropsHookTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

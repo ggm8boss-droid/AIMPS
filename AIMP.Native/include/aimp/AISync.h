@@ -273,6 +273,9 @@ bool ApplyExecutionCarrier(const State&,std::uint64_t through,std::uint64_t arri
 bool QueueRemoteImpact(std::span<const std::byte> payload) noexcept;
 bool TryPopObservedImpact(ImpactEvent& impact) noexcept;
 void PumpOnEngineThread() noexcept;
+// Engine thread, after retail CharacterManager: reconcile only ordinary NPC
+// motion. Paired kills, passages, reactions, and player puppets are excluded.
+void ReconcileDirectPoseOnEngineThread() noexcept;
 // SpawnCharacter creates the NPC-backed visual representation of a remote
 // player. Reserve its runtime identity before native construction because the
 // Character manager can update it re-entrantly before CharacterCreate returns.

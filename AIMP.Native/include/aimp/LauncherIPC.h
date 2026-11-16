@@ -181,6 +181,8 @@ private:
     std::uint64_t aiSyncRejectedFrames_{}; // IPC-worker only, retained across reconnects.
     std::uint64_t publishedDeathSequence_{}; // IPC-worker only.
     std::uint64_t publishedLevelExitSequence_{}; // IPC-worker only.
+    std::uint64_t publishedSpectatePeer_{}; // IPC-worker only.
+    std::uint32_t publishedSpectateCandidates_{}; // IPC-worker only.
     std::array<std::uint8_t,40> publishedCharacterIncarnation_{}; // IPC-worker only.
     bool characterIncarnationPublished_{};
     std::string publishedHiding_; // IPC worker only.

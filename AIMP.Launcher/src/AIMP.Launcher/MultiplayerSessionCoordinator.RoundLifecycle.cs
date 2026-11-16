@@ -67,6 +67,7 @@ internal sealed partial class MultiplayerSessionCoordinator
         object? sender,
         NativePlayerLifecycleStatePayload value)
     {
+        AcceptSpectateState(value);
         var (died, finished) = AcceptLifecycleEdges(value);
         if (died) _ = ReportLocalDeathAsync(value);
         if (finished) _ = ReportLocalMissionCompleteAsync($"native level exit #{value.LevelExitSequence}");
@@ -431,6 +432,8 @@ internal sealed partial class MultiplayerSessionCoordinator
         _deathReportedGeneration = 0;
         _roundEndingGeneration = 0;
         ClearMissionCompleteState();
+        _spectatePeer = 0;
+        _spectateCandidates = 0;
         _frontendLobbyReturnRole = null;
     }
 }

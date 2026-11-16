@@ -31,7 +31,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     // Steam lobby (Friends Only / Public) when the relay supports it.
     private async Task StartSteamHostingAsync(LobbyHost host, LobbyHostOptions options, SteamLobbyVisibility visibility)
     {
-        if (await AnnounceSoloLobbyAsync(host).ConfigureAwait(false) || _steamRelay is null) return;
+        if (_steamRelay is null) return;
         try
         {
             await ActivateSteamForReadyMenuAsync().ConfigureAwait(false);

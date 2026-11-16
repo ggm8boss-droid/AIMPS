@@ -6,7 +6,8 @@ namespace AIMP.Launcher;
 // On top of the Steam relay: hosted lobbies are advertised as Steam lobbies
 // (Friends Only / Public) for the in-game server browser, the in-game Friends
 // page lists Steam friends with Join and pending invites, and lobbies have an
-// "Invite Friends" page. Private lobbies are solo: one slot, no Steam at all.
+// "Invite Friends" page. Private lobbies are not listed (invite or direct IP only)
+// and the host may start one alone.
 internal sealed partial class MultiplayerSessionCoordinator
 {
     private const int MaxServerRows = 8;
@@ -16,7 +17,7 @@ internal sealed partial class MultiplayerSessionCoordinator
     // Null when the relay has no lobby support (tests use a transport-only fake).
     private ISteamLobbies? SteamLobbies => _steamRelay as ISteamLobbies;
 
-    // Private = solo: one slot, no Steam lobby, no relay, started without waiting.
+    // Solo: a Private lobby hosted with nobody else in it (no remote players to wait for).
     private bool IsSoloSessionLocked() => _host?.IsSolo == true;
 
     private bool IsSoloSession()
@@ -30,14 +31,6 @@ internal sealed partial class MultiplayerSessionCoordinator
 
     private static SteamLobbyVisibility ReadLobbyVisibility(ScaleformBridgeMessage message) =>
         SteamRelay.ParseVisibility(message.Get("visibility", "private"));
-
-    private async Task<bool> AnnounceSoloLobbyAsync(LobbyHost host)
-    {
-        if (!host.IsSolo) return false;
-        _diagnostics.Log("Steam", "Solo (Private) lobby: not advertised on Steam and not reachable through the relay.");
-        await SendStatusAsync("Solo lobby created - press Start Game when ready").ConfigureAwait(false);
-        return true;
-    }
 
     private Task<bool> StartRelayHostingAsync(LobbyHost host, LobbyHostOptions options, SteamLobbyVisibility visibility)
     {
@@ -65,7 +58,12 @@ internal sealed partial class MultiplayerSessionCoordinator
     }
 
     private static string DescribeVisibility(SteamLobbyVisibility visibility) =>
-        visibility == SteamLobbyVisibility.Public ? "listed publicly" : "listed for friends";
+        visibility switch
+        {
+            SteamLobbyVisibility.Public => "listed publicly",
+            SteamLobbyVisibility.Private => "not listed",
+            _ => "listed for friends"
+        };
 
     private void OnSteamHostSnapshot(object? sender, LobbySnapshotPayload snapshot)
     {
@@ -273,8 +271,6 @@ internal sealed partial class MultiplayerSessionCoordinator
         bool inLobby;
         lock (_stateGate) inLobby = _host is not null || _client is not null;
         if (!inLobby) throw new InvalidOperationException("Create or join a lobby first, then invite friends from the lobby.");
-        if (IsSoloSession())
-            throw new InvalidOperationException("A Private lobby is solo. Create a Friends Only or Public lobby to invite friends.");
         var name = await RequireSteam().InviteFriendAsync(id).ConfigureAwait(false);
         await SendStatusAsync($"Invite sent to {name}").ConfigureAwait(false);
     }

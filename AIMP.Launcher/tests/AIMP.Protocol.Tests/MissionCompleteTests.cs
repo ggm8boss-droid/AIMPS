@@ -121,6 +121,12 @@ internal static class MissionCompleteTests
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(new NativePlayerLifecycleStatePayload(2, 0, false, 0)));
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(new NativePlayerLifecycleStatePayload(2, 1, false, 0)));
         AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(new NativePlayerLifecycleStatePayload(1, 0, false, 1)));
+        // Schema 3: spectated participant, only after a local death.
+        ModelValidation.Validate(new NativePlayerLifecycleStatePayload(3, 1, true, 0, 42, 2));
+        ModelValidation.Validate(new NativePlayerLifecycleStatePayload(3, 1, true, 0, 0, 0));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(new NativePlayerLifecycleStatePayload(3, 0, false, 1, 42, 1)));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(new NativePlayerLifecycleStatePayload(2, 1, true, 0, 42, 1)));
+        AssertEx.Throws<ProtocolException>(() => ModelValidation.Validate(new NativePlayerLifecycleStatePayload(3, 1, true, 0, 42, 33)));
         AssertEx.Equal("Waiting for players: 1/3 finished, 1 dead",
             MultiplayerSessionCoordinator.MissionWaitMessage(new RoundProgressPayload(id, 1, 1, 1, 3)));
         AssertEx.Equal("Waiting for the other players...", MultiplayerSessionCoordinator.MissionWaitMessage(null));

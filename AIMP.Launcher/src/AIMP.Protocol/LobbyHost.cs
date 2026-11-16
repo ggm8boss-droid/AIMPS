@@ -19,7 +19,8 @@ public sealed record LobbyHostOptions(
     bool RequireWorldPreparation = false,
     bool AlienEnabled = true,
     bool AlienVsSurvivors = false,
-    CampaignLaunchDescriptor? Campaign = null);
+    CampaignLaunchDescriptor? Campaign = null,
+    bool AllowSoloStart = false);
 
 public readonly record struct WorldHostAcceptedMutation(
     WorldNetworkMutation Mutation,
@@ -135,10 +136,13 @@ public sealed partial class LobbyHost : IAsyncDisposable
 
     public int BoundPort => (_listener.LocalEndpoint as IPEndPoint)?.Port ?? _options.Port;
 
-    // A one-slot lobby (solo / Private) has no room for clients, so it starts alone.
-    public bool IsSolo => _options.Capacity == 1;
+    // A one-slot lobby, or one that allows it (Private), may start without any client.
+    public bool AllowsSoloStart => _options.Capacity == 1 || _options.AllowSoloStart;
 
-    private int MinimumClientsToStart => IsSolo ? 0 : 1;
+    // Solo: nobody else is in the lobby, so the round runs without remote players.
+    public bool IsSolo => AllowsSoloStart && _clients.IsEmpty;
+
+    private int MinimumClientsToStart => AllowsSoloStart ? 0 : 1;
 
     public bool CanStart
     {

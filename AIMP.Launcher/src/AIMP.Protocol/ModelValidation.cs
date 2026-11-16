@@ -128,12 +128,16 @@ public static class ModelValidation
     public static void Validate(NativePlayerLifecycleStatePayload? value)
     {
         // Schema 2 adds the monotonic local level-exit edge. A state must carry
-        // at least one terminal edge (death or level exit).
+        // at least one terminal edge (death or level exit). Schema 3 adds the
+        // spectated participant, which only exists after a local death.
         if (value is null
-            || value.SchemaVersion is not (1 or 2)
+            || value.SchemaVersion is not (1 or 2 or 3)
             || (value.SchemaVersion == 1 && (value.DeathSequence == 0 || !value.LocalPlayerDead))
             || (value.LocalPlayerDead != (value.DeathSequence != 0))
-            || (value.DeathSequence == 0 && value.LevelExitSequence == 0))
+            || (value.DeathSequence == 0 && value.LevelExitSequence == 0)
+            || (value.SchemaVersion < 3 && (value.SpectatePeer != 0 || value.SpectateCandidates != 0))
+            || value.SpectateCandidates is < 0 or > 32
+            || (value.SpectatePeer != 0 && !value.LocalPlayerDead))
         {
             throw new ProtocolException("The native player-lifecycle state is invalid.");
         }

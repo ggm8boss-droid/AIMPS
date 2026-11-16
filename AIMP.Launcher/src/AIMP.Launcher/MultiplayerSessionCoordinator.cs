@@ -647,6 +647,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         _ = TryAdvanceRemoteMovementAsync(runtime, now);
         TryScheduleAlienPvPBinding(runtime, now);
         TryScheduleAlienVentMap(runtime,now);
+        TryScheduleSpectateBanner(now);
         UpdateVoiceSession(runtime);
     }
 
@@ -911,9 +912,9 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         LobbyCompatibility.Create(settings),
         RequireWorldPreparation: true,
         AlienEnabled: ReadLobbyAlienEnabled(message),
-        // A Private lobby is solo, so it is always Co-op (Alien vs Survivors needs 2+ players).
-        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message)
-            && ReadLobbyVisibility(message) != SteamLobbyVisibility.Private);
+        AlienVsSurvivors: ReadLobbyAlienVsSurvivors(message),
+        // Private lobbies are not listed but stay joinable; the host may start alone.
+        AllowSoloStart: ReadLobbyVisibility(message) == SteamLobbyVisibility.Private);
 
     private static string ResolveServerName(
         LauncherSettings settings,
@@ -929,8 +930,7 @@ internal sealed partial class MultiplayerSessionCoordinator : IDisposable
         // The menu stepper defaults to "2 Players", which capped lobbies at two ("Lobby is full").
         // The menu selection is ignored for now: every lobby uses the default capacity (4).
         // Remove this line to honor the menu selection again.
-        // Private lobbies are solo: one slot, started without waiting for anyone.
-        ReadLobbyVisibility(message) == SteamLobbyVisibility.Private ? 1 : ProtocolConstants.DefaultLobbyCapacity;
+        ProtocolConstants.DefaultLobbyCapacity;
 
     // Original menu-driven capacity resolution (currently unused, see ResolveCapacity).
     private static int ResolveRequestedCapacity(ScaleformBridgeMessage message) =>

@@ -587,8 +587,35 @@ struct GraphWalk {
     }
 };
 
+// Diag 193327/213331 (Crawl Space, 7th level load in one process): both PCs
+// crashed inside 6A9360 graph construction when allocator[6] (VA 01BE1BD8+18)
+// returned null for a 0x120 clip; retail never checks it. Probe the heap
+// before construction and take the native missing-resource path instead.
+using AnimHeapAllocFn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t);
+using AnimHeapFreeFn = void(__thiscall*)(void*, void*);
+constexpr std::uint32_t kAnimHeapProbeBytes = 0x4000U;
+std::atomic<std::uint64_t> gAnimHeapGraphRefusals{};
+
+bool AnimationHeapHasHeadroom() noexcept {
+    std::uintptr_t heap{}, vtable{}, alloc{}, release{};
+    if (!Read(gGraphBase + 0x017E1BF0U, 0U, heap) || heap == 0U ||
+        !Read(heap, 0U, vtable) || !Read(vtable, 0x0CU, alloc) || !Read(vtable, 0x14U, release) ||
+        !CodeAddress(alloc) || !CodeAddress(release)) return true; // unknown: retail behaviour
+    __try {
+        void* const block = reinterpret_cast<AnimHeapAllocFn>(alloc)(
+            reinterpret_cast<void*>(heap), kAnimHeapProbeBytes, 0x10U);
+        if (block == nullptr) return false;
+        reinterpret_cast<AnimHeapFreeFn>(release)(reinterpret_cast<void*>(heap), block);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
+    return true;
+}
+
 std::uintptr_t __fastcall GraphLookupDetour(void* library, void*, const void* request) {
     const auto graph = reinterpret_cast<GraphLookupFn>(gGraphBase + 0x00631400U)(library, request);
+    if (graph != 0U && !AnimationHeapHasHeadroom()) {
+        gAnimHeapGraphRefusals.fetch_add(1U, std::memory_order_relaxed);
+        return 0U; // 6A97A2 -> 6A97DE: nothing allocated yet
+    }
     const auto* admission = gGraphAdmission;
     if (admission == nullptr || graph == 0U) return graph;
     std::uintptr_t children{};

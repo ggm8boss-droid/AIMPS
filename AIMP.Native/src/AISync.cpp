@@ -12,6 +12,8 @@
 #include "aimp/AlienPvPAttackManager.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
 #include "aimp/PlayerHidingRuntime.h"
+#include "aimp/PlayerLifecycle.h"
+#include "aimp/PlayerSpectatePolicy.h"
 #include <limits>
 #include "aimp/AISyncProfiling.h"
 #include "aimp/AISyncExecutionPolicy.h"
@@ -23,6 +25,7 @@
 #include "aimp/AISyncMarkerIdentity.h"
 #include "aimp/AISyncRouteExecution.h"
 #include "aimp/AISyncRecoveryMotion.h"
+#include "aimp/AISyncHybridMotion.h"
 #include "aimp/AISyncHostProducer.h"
 #include "aimp/AISyncInteraction.h"
 #include "aimp/AISyncInteractionRuntime.h"
@@ -59,6 +62,24 @@ static_assert(std::is_trivially_copyable_v<ImpactEvent>);
 constexpr std::size_t kParticipants = 32U, kActors = 256U, kRing = 1024U;
 constexpr ULONGLONG kSendPeriod = 50ULL, kRefreshPeriod = 250ULL, kTimeout = 1500ULL;
 constexpr ULONGLONG kManagerDormancyPeriod = 500ULL;
+// Client AI locomotion through a local retail Move (see DriveNativeFollow).
+constexpr bool kNativeFollowLocomotion=true;
+// GetTickCount64 advances in ~16 ms steps: Host pose velocities from it read
+// 15 m/s for an 8 m/s sprint and Client interpolation moved in 16 ms stairs.
+// QPC-derived milliseconds on the GetTickCount64 epoch, so values still mix
+// with arrival ticks taken from GetTickCount64 (within one tick step).
+ULONGLONG PreciseTickMs() noexcept {
+    static const auto base=[]{
+        LARGE_INTEGER frequency{},counter{};
+        QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&counter);
+        return std::array<long long,3>{frequency.QuadPart,counter.QuadPart,
+            static_cast<long long>(GetTickCount64())};
+    }();
+    LARGE_INTEGER counter{};
+    if(base[0]<=0||!QueryPerformanceCounter(&counter))return GetTickCount64();
+    const auto delta=counter.QuadPart-base[1];
+    return static_cast<ULONGLONG>(base[2]+(delta/base[0])*1000LL+(delta%base[0])*1000LL/base[0]);
+}
 constexpr ULONGLONG kDeadTargetGracePeriod = 1500ULL;
 constexpr ULONGLONG kPostDeathArbitrationGracePeriod = 2000ULL;
 constexpr ULONGLONG kPostDeathRecentSenseHold = 2000ULL;
@@ -221,11 +242,29 @@ struct Actor {
     // capability execution. Never used for placement or acknowledged as applied.
     State received{};
     State recoveryPose{};
+    // The Host owns NPC spatial truth. This timeline never drives an NPC brain.
+    hybrid_motion::Timeline directPoseTimeline{};
+    std::uint32_t directPoseBirth{};
+    // Do not teleport at stream frequency: only recover prolonged multi-metre divergence.
+    ULONGLONG directPoseDivergenceSince{}, directPoseLastEmergencyCorrection{};
+    // Progress anchor: the body is blocked when retail root motion runs but
+    // the Character does not leave this point (514: 4-5 s frozen walks).
+    float directPoseAnchor[3]{};
+    ULONGLONG directPoseAnchorAt{}, directPoseLastStuckCorrection{}, directPoseAssistAt{};
     movement::ProgressClock recoveryProgress{};
     movement::ObservedTrail observedTrail{};
     ULONGLONG recoveryPoseAt{},recoveryLastTick{},recoveryLastHardSnap{};
     std::uint32_t recoveryHandoffLifecycleRevision{};
     bool recoveryFollowing{},recoveryNativeArmed{};
+    // Client native follow: a LOCAL retail Move (kind1) owned by this mod,
+    // whose goal tracks the Host pose. Retail navigation/locomotion executes it.
+    struct NativeFollow {
+        std::uintptr_t object{},control{};
+        ULONGLONG createdAt{},stillSince{},retryAt{},divergedSince{},idleYawSince{};
+        float divergedAnchorX{},divergedAnchorZ{};
+        std::uint32_t failures{};
+        bool stopping{};
+    } follow{};
     // Latest Host state in causal stream order (never an older queued carrier).
     std::uint32_t streamRevision{}, streamBirth{}, streamCycleState{}, streamPairRevision{}, streamCycleType{};
     // Execution latency trace (diagnostics only).
@@ -846,6 +885,8 @@ std::atomic<std::uint64_t> gActionCaptured{}, gActionTransitions{};
 std::atomic<std::uint64_t> gActionReferencesCaptured{},gActionReferencesUnbound{};
 std::atomic<std::uint64_t> gReservedByOutcome{},gReservedByPair{};
 std::atomic<std::uint64_t> gCycleCallsCaptured{},gCycleCallsRefused{},gCycleCallsPublished{},gCycleCallsReplayed{},gCycleCallsReplayFailed{};
+std::atomic<std::uint64_t> gDirectLocomotionConstructorsConsumed{};
+std::atomic<std::uint64_t> gDirectPoseStuckCorrections{},gDirectPoseEmergencyCorrections{},gDirectPoseAssistFrames{},gDirectPoseActionFollowFrames{};
 std::atomic<std::uint32_t> gLastRefusedCycleCall{};
 std::atomic<std::uint64_t> gIntakeHeldByPair{},gIntakeHeldByHealth{},gIntakeHeldByParticipant{},gIntakeHeldByCombat{};
 std::atomic<std::uint64_t> gExecutionCaptured{}, gExecutionTransitions{}, gExecutionReplayed{}, gExecutionReplayRejected{};
@@ -854,6 +895,7 @@ std::atomic<std::uint64_t> gLifecycleCaptured{}, gLifecycleApplied{}, gLifecycle
 std::atomic<std::uint64_t> gInitialNativePosesPreserved{};
 std::atomic<std::uint64_t> gImpactCaptured{}, gImpactQueued{}, gImpactApplied{}, gImpactRejected{};
 std::atomic<std::uint64_t> gImpactShooterRemaps{}, gImpactShooterUnresolved{};
+std::atomic<std::uint64_t> gImpactStimulusForwarded{}, gImpactStimulusApplied{}, gImpactDamagelessDropped{};
 std::atomic<std::uint64_t> gWithdrawSamples{}, gWithdrawTransitions{}, gWithdrawApplied{};
 std::atomic<std::uint64_t> gBackstageCaptured{}, gBackstageTransitions{}, gBackstageApplied{}, gBackstageRejected{};
 std::atomic<std::uint64_t> gPlacementVerified{}, gPlacementRejected{}, gLifecycleRetries{};
@@ -3026,10 +3068,13 @@ bool OrdinaryLocomotionCycle(const std::uint32_t type,const std::uint32_t state)
         // Its actual request and native animation retain heading authority.
         (type==0xEAC040U&&state==0x39U);
 }
-void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
+void CapturePose(Actor& actor, ULONGLONG now) noexcept {
     // Physical observations bound the Client's native navigation goals. The
     // typed Host command still owns permission; no Character transform is set.
-    if (actor.hasLastPosition && now - actor.lastPoseSample < kSendPeriod) return;
+    now = PreciseTickMs();
+    // Publish gates on the coarse tick (>=50 ms); a precise 47 ms gap must not
+    // drop the sample and stretch that send period to 100 ms.
+    if (actor.hasLastPosition && now - actor.lastPoseSample < kSendPeriod - 16ULL) return;
     float position[3]{}, yaw{};
     if (!Read(actor.character + kPositionOffset, position[0]) ||
         !Read(actor.character + kPositionOffset + 4U, position[1]) ||
@@ -3095,9 +3140,11 @@ void CapturePose(Actor& actor, const ULONGLONG now) noexcept {
     if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle,cycleType)||cycleType<gBase||
         !Read(cycle+0x1AU,cycleState)||!OrdinaryLocomotionCycle(static_cast<std::uint32_t>(cycleType-gBase),cycleState)||
         (actor.desired.executionFlags&ExecutionPaired)!=0U)actor.desired.motionFlags|=2U;
-    // Replicate the authored INPUT. Feeding the Host's already braked output
-    // (+198) back into the Client's input (+194) applies braking twice.
-    if(Read(actor.character+0x42A8U,movement)&&movement&&Read(movement+0x194U,gait)&&gait<=3U)
+    // Direct locomotion: replicate the gait the Host actually PLAYS (+198).
+    // The Client hook (0x5B874) overwrites +194 and +198 after retail's own
+    // selection, so nothing brakes twice. Sending the input (+194) made the
+    // 511 Client run gait 3 while the Host played 2 (diag 174301, t=4-6 s).
+    if(Read(actor.character+0x42A8U,movement)&&movement&&Read(movement+0x198U,gait)&&gait<=3U)
         actor.desired.moveType=gait;
     const float speed=std::hypot(actor.desired.motionVelocity[0],actor.desired.motionVelocity[2]);
     actor.desired.velocityX=actor.desired.motionVelocity[0];actor.desired.velocityZ=actor.desired.motionVelocity[2];
@@ -4871,6 +4918,7 @@ void SamplePresentation(Actor& actor, const ULONGLONG now, const std::uint32_t p
     gPresentationProbeWrite.store(write + 1U, std::memory_order_release);
     gPresentationSamples.fetch_add(1U, std::memory_order_relaxed);
 }
+void ReleaseNativeFollow(Actor& actor,bool cancel=true) noexcept;
 bool Release(Actor& actor) noexcept;
 Actor* Admit(const std::uintptr_t c) noexcept {
     // CharacterCreate may run a manager update before its detour can publish
@@ -5149,6 +5197,10 @@ bool Release(Actor& actor) noexcept {
     actor.rejectedNavigationRevision = actor.rejectedNavigationRequestRevision = 0U;
     actor.lastNavigationAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
+    actor.directPoseTimeline.Reset(); actor.directPoseBirth = 0U;
+    actor.directPoseDivergenceSince=actor.directPoseLastEmergencyCorrection=0U;
+    ReleaseNativeFollow(actor);
+    actor.recoveryFollowing = actor.recoveryNativeArmed = false;
     if (actor.character != 0U && Client()) {
         // Dropping replication must not manufacture Idle over an action that
         // owns native motion. The next scope needs a fresh Host sample.
@@ -6468,6 +6520,24 @@ bool DispatchNativeIntent(const std::uintptr_t cycle,const NativeIntentEntry ent
 transactions::NativeOutcome InvokeNativeIntent(const transactions::Record& record,const execution::LocalActorBinding& binding) noexcept {
     using transactions::NativeOutcome;
     if(CheckNativeIntent(record,binding)!=execution::Readiness::Ready)return NativeOutcome::Unknown;
+    // Host locomotion start/stop constructors (55/03/59) are pure presentation
+    // of its own Move. With the direct pose motor already holding an ordinary
+    // locomotion cycle, replaying them destroyed that cycle: 511 rebuilt the
+    // native graph on every Host start/stop (move_activate from 55/59). They
+    // still run when they are the Host's real exit from a reaction/script.
+    if(LocomotionExitIntent(record)) {
+        if(auto* actor=Find(binding.character);actor&&(actor->recoveryNativeArmed||kNativeFollowLocomotion)) {
+            std::uintptr_t cycle{},table{};std::uint8_t state{};
+            if(Read(binding.character+0x36CU,cycle)&&cycle&&Read(cycle,table)&&table>=gBase&&
+                Read(cycle+0x1AU,state)&&
+                HybridMayConsumeConstructor(record.intent.words[0],static_cast<std::uint32_t>(table-gBase),state)) {
+                actor->reactionCycle=0U;
+                gDirectLocomotionConstructorsConsumed.fetch_add(1U,std::memory_order_relaxed);
+                return NativeOutcome::Admitted;
+            }
+        }
+        static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(binding.character));
+    }
     // Constructors destroy the previous cycle before initializing the new one.
     // A readiness probe releases its temporary Ref before that destruction;
     // keep the retail movement resource alive across callbacks and readback.
@@ -6698,6 +6768,8 @@ execution::OwnershipCheck DrainTransactionActor(void*, const execution::Ownershi
     ++gHandoffAttempts;
     Actor* actor{}; if (!TransactionActorMatches(token,actor)) return execution::OwnershipCheck::Unknown;
     if (actor->transactionDrainStarted && actor->transactionDrainSerial != token.serial) return execution::OwnershipCheck::Unknown;
+    // A Host action needs an empty scheduler: retire the local follow Move.
+    ReleaseNativeFollow(*actor);
     if (!actor->transactionDrainStarted) {
         const auto prepared = PrepareTransactionActor(nullptr,token.scope,token.owner,token.actor);
         if (prepared != execution::OwnershipCheck::Ready) return prepared;
@@ -7851,8 +7923,53 @@ bool ApplyNativeImpactDamageSafe(const std::uintptr_t target, const std::uint32_
     }
 }
 
+// Exact replay of the zero-damage branch of the retail receiver 007CDCF0
+// (007CDE26-007CDEF4) for a Client-owned hit: zone table entry from
+// [[016F182C]+20C][descriptor]+4C+zone*30; if entry+2E bit0, notify the
+// victim brain (007C4EC0(this=victimBrain, shooterBrain, descriptor)); then,
+// when the victim brain is the Alien kind (brain+64 -> +4 == 1) and entry+18
+// exceeds [0148FD04], add pellets*entry+18 to the repel meter
+// [brain+4238]+6C unless +79 is set (retail then adds 0).
+bool ApplyNativeImpactStimulusSafe(const std::uintptr_t target, const std::uintptr_t source,
+    const std::uint32_t descriptor, const std::uint32_t zone, const std::uint32_t pellets) noexcept {
+    using Getter = std::uintptr_t(__thiscall*)(void*);
+    using Notify = void(__thiscall*)(void*, std::uintptr_t, std::uint32_t);
+    if (target == 0U || source == 0U || gBase == 0U || pellets == 0U || pellets > 16U) return false;
+    __try {
+        const auto brainOf = [](const std::uintptr_t object) noexcept {
+            const auto vtable = *reinterpret_cast<std::uintptr_t*>(object);
+            return reinterpret_cast<Getter>(*reinterpret_cast<std::uintptr_t*>(vtable + 0x1CU))(
+                reinterpret_cast<void*>(object));
+        };
+        const auto zones = *reinterpret_cast<std::uintptr_t*>(
+            *reinterpret_cast<std::uintptr_t*>(gBase + 0x012F182CU) + 0x20CU);
+        const auto definition = zones ? *reinterpret_cast<std::uintptr_t*>(zones + (descriptor & 0xFFFFU) * 4U) : 0U;
+        if (definition == 0U) return false;
+        const auto entry = definition + 0x4CU + zone * 0x30U;
+        const auto victimBrain = brainOf(target);
+        if (victimBrain == 0U) return false;
+        if ((*reinterpret_cast<std::uint8_t*>(entry + 0x2EU) & 1U) != 0U) {
+            const auto shooterBrain = brainOf(source);
+            reinterpret_cast<Notify>(gBase + 0x003C4EC0U)(
+                reinterpret_cast<void*>(victimBrain), shooterBrain, descriptor & 0xFFFFU);
+        }
+        const auto kind = *reinterpret_cast<std::uintptr_t*>(victimBrain + 0x64U);
+        const float weight = *reinterpret_cast<float*>(entry + 0x18U);
+        if (kind != 0U && *reinterpret_cast<std::int32_t*>(kind + 4U) == 1 &&
+            weight > *reinterpret_cast<float*>(gBase + 0x0108FD04U)) {
+            const auto repel = *reinterpret_cast<std::uintptr_t*>(victimBrain + 0x4238U);
+            if (repel != 0U && *reinterpret_cast<std::uint8_t*>(repel + 0x79U) == 0U)
+                *reinterpret_cast<float*>(repel + 0x6CU) += static_cast<float>(pellets) * weight;
+        }
+        gImpactStimulusApplied.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool PublishClientImpact(const std::uintptr_t victim, int* hit,
-    const std::uint32_t channel) noexcept {
+    std::uint32_t channel) noexcept {
     if (gRole.load(std::memory_order_acquire) != Role::Client || !EngineThread() || !Stable() || victim == 0U ||
         hit == nullptr || gCurrent.localPeer == 0U || (channel != 1U && channel != 2U)) return false;
     if (ResolveImpactSource(hit) != LocalPlayer()) return false;
@@ -7865,7 +7982,25 @@ bool PublishClientImpact(const std::uintptr_t victim, int* hit,
         if (!Read(reinterpret_cast<std::uintptr_t>(hit) + 0x38U, secondary)) return false;
         damage = static_cast<std::int32_t>(secondary);
     }
-    if (damage <= 0 || damage > 0xFFFF) return false;
+    // Zero-HP hits (flame, revolver on the Alien) only run the retail stimulus
+    // branch of 007CDCF0: target notification + flame-repel meter. 517 dropped
+    // them here, so a Client could never repel the Host Alien. Forward them as
+    // channel 3 with the zone (hit+1A) and pellet count (hit+24).
+    std::uint32_t packedStimulus{};
+    if (damage == 0 && channel == 1U) {
+        std::int8_t zone{}; std::int32_t pellets{};
+        if (!Read(reinterpret_cast<std::uintptr_t>(hit) + 0x1AU, zone) || zone < 0 ||
+            !Read(reinterpret_cast<std::uintptr_t>(hit) + 0x24U, pellets) || pellets <= 0 || pellets > 16) {
+            gImpactDamagelessDropped.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        packedStimulus = static_cast<std::uint32_t>(static_cast<std::uint8_t>(zone)) |
+            (static_cast<std::uint32_t>(pellets) << 8U);
+        channel = 3U;
+    } else if (damage <= 0 || damage > 0xFFFF) {
+        gImpactDamagelessDropped.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
 
     std::uint32_t entityA{}, entityB{}, type{}, runtimeId{}, descriptor{};
     if (!CharacterIdentity(victim, entityA, entityB, type) || !AICharacterClass(type) ||
@@ -7887,8 +8022,10 @@ bool PublishClientImpact(const std::uintptr_t victim, int* hit,
     event.targetA = entityA; event.targetB = entityB; event.targetClass = type;
     event.targetBirth = actor->remoteBirth;
     event.damage = static_cast<std::uint32_t>(damage);
-    event.descriptor = descriptor;
+    event.descriptor = channel == 3U ? (descriptor & 0xFFFFU) : descriptor;
     event.channel = channel;
+    event.reserved = packedStimulus;
+    if (channel == 3U) gImpactStimulusForwarded.fetch_add(1U, std::memory_order_relaxed);
 
     std::lock_guard lock(gImpactMailboxMutex);
     const auto pending = gOutgoingImpactWrite - gOutgoingImpactRead;
@@ -7940,10 +8077,10 @@ bool HostReplicaImpactAlreadyOwned(void* receiver, int* hit,
     } else {
         return false;
     }
-    // Zero-damage impacts have a separate retail stimulus path (including
-    // fear/stagger). Keep that Host path until those stimuli have an exact
-    // portable request; a zero HP delta does not make an impact redundant.
-    return damage > 0;
+    // 518: the owning Client now forwards primary zero-damage hits as the
+    // exact stimulus (channel 3). The Replica's own retail copy would apply
+    // that stimulus a second time; secondary zero-damage stays Host-local.
+    return damage > 0 || channel == 1U;
 }
 void __fastcall CharacterImpactDetour(void* receiver, void*, int* hit) noexcept {
     const auto original = reinterpret_cast<CharacterImpact>(
@@ -9809,8 +9946,11 @@ bool ValidImpactEvent(const ImpactEvent& value) noexcept {
     return value.version == 2U && value.nativeGeneration != 0U && value.sessionCookie != 0U &&
         value.worldGeneration != 0U && value.sequence != 0U && value.sourcePeer != 0U &&
         (value.targetA != 0U || value.targetB != 0U) && AICharacterClass(value.targetClass) &&
-        value.targetBirth != 0U && value.damage != 0U && value.damage <= 0xFFFFU &&
-        (value.channel == 1U || value.channel == 2U) && value.reserved == 0U;
+        value.targetBirth != 0U &&
+        (((value.channel == 1U || value.channel == 2U) && value.damage != 0U &&
+            value.damage <= 0xFFFFU && value.reserved == 0U) ||
+         (value.channel == 3U && value.damage == 0U && value.descriptor <= 0xFFFFU &&
+            (value.reserved & 0xFFU) < 0x80U && (value.reserved >> 8U) >= 1U && (value.reserved >> 8U) <= 16U));
 }
 
 bool QueueRemote(const std::span<const std::byte> payload, const std::uint64_t through) noexcept {
@@ -9883,12 +10023,17 @@ void BeginExecutionCarrierScope(const transactions::Scope& scope) noexcept {
     gIncomingUsed.fill(false); gInitialPlacementUsed.fill(false);
     for(auto& pending:gIncomingOutcomes)pending.clear();gIncomingOutcomeCount=0;
     for(auto& actor:gActors)if(actor.character){
+        if(actor.recoveryNativeArmed)
+            static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
         actor.received={};actor.streamRevision=actor.streamBirth=actor.streamCycleState=actor.streamPairRevision=actor.streamCycleType=0U;
         actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;
         actor.recoveryPose={};actor.recoveryPoseAt=actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
+        actor.directPoseTimeline.Reset();actor.directPoseBirth=0U;
+        actor.directPoseDivergenceSince=actor.directPoseLastEmergencyCorrection=0U;
         actor.observedTrail.Clear();
         actor.recoveryProgress={};
         actor.recoveryHandoffLifecycleRevision=0;
+        ReleaseNativeFollow(actor);
         actor.recoveryFollowing=actor.recoveryNativeArmed=false;
     }
     route_execution::BeginScope(scope);
@@ -9933,6 +10078,25 @@ bool ApplyExecutionCarrier(const State& state,std::uint64_t through,std::uint64_
         } else if((state.motionFlags&6U)!=0U||(state.executionFlags&ExecutionPaired)!=0U||
             ProxyWithdrawn(state)||health::Terminal(state.health))actor->observedTrail.Clear();
         actor->recoveryPose=state;actor->recoveryPoseAt=arrivalTick;
+        // Motion has a Host monotonic clock and an authenticated local arrival
+        // timestamp. Keep only the current incarnation; old segments must
+        // never interpolate across a death, respawn or world transition.
+        if(actor->directPoseBirth!=state.birth) {
+            actor->directPoseTimeline.Reset();
+            actor->directPoseBirth=state.birth;
+        }
+        if((state.motionFlags&hybrid_motion::Valid)!=0U) {
+            hybrid_motion::Sample sample{};
+            sample.tick=state.motionTick;
+            for(std::size_t axis=0;axis<3U;++axis) {
+                sample.position[axis]=state.position[axis];
+                sample.velocity[axis]=state.motionVelocity[axis];
+            }
+            sample.yaw=state.yaw;sample.flags=state.motionFlags;
+            static_cast<void>(actor->directPoseTimeline.Push(sample,arrivalTick));
+        } else {
+            actor->directPoseTimeline.Reset();
+        }
     }
     if(state.executionRevision!=0U&&state.executionRevision!=actor->arrivalExecRevision){
         actor->arrivalExecRevision=state.executionRevision;actor->arrivalExecTick=GetTickCount64();actor->arrivalExecUtc=UtcMs();
@@ -10046,7 +10210,11 @@ void PumpHostImpacts() noexcept {
             gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
             continue;
         }
-        if (!ApplyNativeImpactDamageSafe(target, impact.damage, source, impact.descriptor)) {
+        const bool applied = impact.channel == 3U
+            ? ApplyNativeImpactStimulusSafe(target, source, impact.descriptor,
+                impact.reserved & 0xFFU, impact.reserved >> 8U)
+            : ApplyNativeImpactDamageSafe(target, impact.damage, source, impact.descriptor);
+        if (!applied) {
             gImpactRejected.fetch_add(1U, std::memory_order_relaxed);
             continue;
         }
@@ -10055,6 +10223,157 @@ void PumpHostImpacts() noexcept {
     }
 }
 
+// ---- Client native follow locomotion (524+) ------------------------------
+// Retail producer 0070A940 sequence (Alien MoveToMostRecentSensedPosition):
+// gait M+194 -> factory 00683BF0 -> initial goal 006777B0 -> +B8|=1 ->
+// replace-submit 00683CE0 -> clear +B8 bit5. useStop=0 and stopping/stop
+// distances -1 keep the Move alive while 006C7550 (phase3, no pending edit)
+// moves its goal every frame; retail replans or edits the terminal in place.
+// A Host stop becomes a final goal: retail brakes and plays its own stop.
+std::atomic<std::uint64_t> gFollowCreated{},gFollowCreateFailures{},gFollowCompleted{},gFollowCancelled{},
+    gFollowEmergencies{},gFollowIdleTurns{},gFollowDivergenceReplans{},gSpectateFallbackCandidates{};
+struct FollowRef {std::uintptr_t object,control;};
+bool FollowNativeCreate(std::uintptr_t character,const float* goal,FollowRef& out) noexcept {
+    out={};
+    __try {
+        reinterpret_cast<FollowRef*(__thiscall*)(void*,FollowRef*)>(gBase+0x283BF0U)(
+            reinterpret_cast<void*>(character+0x2CD0U),&out);
+        if(!out.object||!out.control)return false;
+        if(*reinterpret_cast<const std::uintptr_t*>(out.object)!=gBase+0xEB1A70U)return false;
+        reinterpret_cast<void(__thiscall*)(void*,const float*)>(gBase+0x2777B0U)(reinterpret_cast<void*>(out.object),goal);
+        *reinterpret_cast<std::uint8_t*>(out.object+0x18U)=0U; // our own Ref observes it; no retained list entry
+        *reinterpret_cast<std::uint8_t*>(out.object+0xB8U)|=1U; // 004659D0 local route bounds
+        std::uint32_t type{};
+        const auto info=*reinterpret_cast<const std::uintptr_t*>(character+0x64U);
+        if(info)type=*reinterpret_cast<const std::uint32_t*>(info+4U);
+        if(type==3U||type==4U||type==6U||type==9U) {
+            *reinterpret_cast<float*>(out.object+0x9CU)=8.0F;*reinterpret_cast<float*>(out.object+0xA0U)=1.15F;
+        }
+        const auto accepted=reinterpret_cast<std::uint8_t(__thiscall*)(void*)>(gBase+0x283CE0U)(reinterpret_cast<void*>(out.object));
+        *reinterpret_cast<std::uint8_t*>(out.object+0xB8U)&=static_cast<std::uint8_t>(~0x20U);
+        return accepted!=0U;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+bool FollowNativeGoal(std::uintptr_t request,const float* goal) noexcept {
+    __try {reinterpret_cast<void(__thiscall*)(void*,const float*)>(gBase+0x2C7550U)(reinterpret_cast<void*>(request),goal);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+void FollowNativeRelease(FollowRef ref,bool cancel) noexcept {
+    __try {
+        if(cancel) {
+            const auto status=*reinterpret_cast<const std::uint32_t*>(ref.object+0xCU);
+            if(status<=2U)reinterpret_cast<void(__thiscall*)(void*)>(gBase+0x283DB0U)(reinterpret_cast<void*>(ref.object));
+        }
+        reinterpret_cast<void(__thiscall*)(FollowRef*)>(gBase+0xD770U)(&ref);
+    } __except(EXCEPTION_EXECUTE_HANDLER){}
+}
+bool FollowGait(std::uintptr_t character,std::uint32_t gait) noexcept {
+    __try {
+        const auto movement=*reinterpret_cast<const std::uintptr_t*>(character+0x42A8U);
+        if(!movement||gait>3U)return false;
+        auto& input=*reinterpret_cast<std::uint32_t*>(movement+0x194U);
+        if(input!=gait){input=gait;*reinterpret_cast<std::uint32_t*>(movement+0x190U)=0U;}
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+// The declaration lives in the file's original unnamed namespace.
+// Reopen it so this definition refers to that same function: otherwise
+// the enclosing ai_sync namespace adds a second overload and C2668 fires.
+namespace {
+void ReleaseNativeFollow(Actor& actor,bool cancel) noexcept {
+    if(!actor.follow.object)return;
+    FollowNativeRelease({actor.follow.object,actor.follow.control},cancel);
+    if(cancel)gFollowCancelled.fetch_add(1U,std::memory_order_relaxed);
+    const auto failures=actor.follow.failures;const auto retry=actor.follow.retryAt;
+    actor.follow={};actor.follow.failures=failures;actor.follow.retryAt=retry;
+}
+} // namespace
+void FollowIdleFacing(Actor& actor,const hybrid_motion::Target& target,const float* local,float yaw,ULONGLONG now) noexcept {
+    // Standing still on both peers: keep the Host facing with a bounded turn.
+    auto& f=actor.follow;
+    float delta=target.yaw-yaw;
+    while(delta>3.14159265F)delta-=6.2831853F;
+    while(delta<-3.14159265F)delta+=6.2831853F;
+    if(std::abs(delta)<0.35F){f.idleYawSince=0U;return;}
+    if(!f.idleYawSince){f.idleYawSince=now;return;}
+    if(now-f.idleYawSince<400U)return;
+    const float step=std::clamp(delta,-0.05F,0.05F); // ~3 rad/s at 60 fps
+    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,local,yaw+step))
+        gFollowIdleTurns.fetch_add(1U,std::memory_order_relaxed);
+}
+void DriveNativeFollow(Actor& actor,const hybrid_motion::Target& target,std::uint32_t hostGait,ULONGLONG now) noexcept {
+    auto& f=actor.follow;
+    float local[3]{},yaw{};
+    if(!Read(actor.character+kPositionOffset,local[0])||!Read(actor.character+kPositionOffset+4U,local[1])||
+        !Read(actor.character+kPositionOffset+8U,local[2])||!Read(actor.character+kYawOffset,yaw)){ReleaseNativeFollow(actor);return;}
+    const float dx=target.position[0]-local[0],dz=target.position[2]-local[2];
+    const float planar=std::sqrt(dx*dx+dz*dz);
+    const float speed=std::hypot(target.velocity[0],target.velocity[2]);
+    // Distance alone is not a stuck route: the Host may be several metres
+    // ahead while the local Alien is still walking. Only retire a native
+    // follow that has failed to translate 0.15 m over 750 ms despite that
+    // large error. With no live route, allow creation/retry normally.
+    if(planar>3.5F && f.object) {
+        if(!f.divergedSince) {
+            f.divergedSince=now;
+            f.divergedAnchorX=local[0];f.divergedAnchorZ=local[2];
+        } else if(now-f.divergedSince>=750U) {
+            const float moved=std::hypot(local[0]-f.divergedAnchorX,local[2]-f.divergedAnchorZ);
+            if(moved<0.15F) {
+                ReleaseNativeFollow(actor);
+                f.retryAt=now+250U;
+                gFollowDivergenceReplans.fetch_add(1U,std::memory_order_relaxed);
+                return;
+            }
+            f.divergedSince=now;
+            f.divergedAnchorX=local[0];f.divergedAnchorZ=local[2];
+        }
+    } else f.divergedSince=0U;
+    // Observe the live request: 3 done, 4 failed, 5 removed, 6 released.
+    if(f.object) {
+        std::uint32_t status{};
+        if(!Read(f.object+0xCU,status)||status>2U) {
+            if(status==3U)gFollowCompleted.fetch_add(1U,std::memory_order_relaxed);
+            else if(status==4U){++f.failures;f.retryAt=now+std::min<ULONGLONG>(2000U,150U*f.failures);}
+            ReleaseNativeFollow(actor,false);
+        }
+    }
+    const bool hostMoving=speed>0.25F;
+    if(hostMoving)f.stillSince=0U;else if(!f.stillSince)f.stillSince=now;
+    const bool hostStopped=!hostMoving&&now-f.stillSince>=150U;
+    // Gait: the Host's effective gait; one step faster when clearly behind.
+    std::uint32_t gait=hostGait<=3U?hostGait:1U;
+    if(planar>2.0F&&gait<3U)++gait;
+    float goal[3]{target.position[0],target.position[1],target.position[2]};
+    if(!hostStopped&&speed>0.05F) {
+        // Through-goal ahead of the Host so retail never reaches its braking
+        // distance while the Host keeps moving.
+        const float lead=std::clamp(speed*0.6F,1.2F,4.0F);
+        goal[0]+=target.velocity[0]/speed*lead;goal[2]+=target.velocity[2]/speed*lead;
+    }
+    const bool needsMove=hostMoving||planar>0.6F;
+    if(!f.object) {
+        if(!needsMove||now<f.retryAt){FollowIdleFacing(actor,target,local,yaw,now);return;}
+        const character_direct_step_runtime::MovementResourceLease resources(actor.character);
+        if(!resources)return;
+        static_cast<void>(FollowGait(actor.character,gait));
+        FollowRef ref{};
+        // A failed far goal (off-mesh extrapolation) retries on the Host pose.
+        const float* initial=(f.failures&1U)?target.position.data():goal;
+        if(!FollowNativeCreate(actor.character,initial,ref)) {
+            if(ref.object)FollowNativeRelease(ref,true);
+            ++f.failures;f.retryAt=now+std::min<ULONGLONG>(2000U,150U*f.failures);
+            gFollowCreateFailures.fetch_add(1U,std::memory_order_relaxed);return;
+        }
+        f.object=ref.object;f.control=ref.control;f.createdAt=now;f.stopping=false;f.idleYawSince=0U;
+        gFollowCreated.fetch_add(1U,std::memory_order_relaxed);return;
+    }
+    f.failures=0U;
+    static_cast<void>(FollowGait(actor.character,gait));
+    f.stopping=hostStopped;
+    // Every frame: 006C7550 accepts only in phase3 without a pending edit.
+    static_cast<void>(FollowNativeGoal(f.object,goal));
+}
 void PublishLocalIncarnation() noexcept {
     auto& registry=character_incarnations::NativeRegistry();
     character_incarnations::Ticket ticket{};
@@ -10069,6 +10388,37 @@ void PublishLocalIncarnation() noexcept {
         }
     }
     static_cast<void>(registry.PublishLocal(ticket));
+}
+// PlayerLifecycle spectate: living remote participants of this exact world,
+// ascending peer order. The Alien PvP owner's parked human is never watchable.
+static void PumpPlayerSpectate(const std::uint32_t generation, const bool cameraReserved,
+    const std::uint64_t alienOwner) noexcept {
+    std::array<player_lifecycle::SpectateCandidate, player_lifecycle::spectate::kMaxCandidates> candidates{};
+    std::size_t count{};
+    if (Stable() && gCurrent.nativeGeneration == generation) {
+        for (std::uint32_t i = 0U; i < gCurrent.participantCount && count < candidates.size(); ++i) {
+            const auto peer = gCurrent.participants[i].peer;
+            if (peer == 0U || peer == gCurrent.localPeer || peer == alienOwner) continue;
+            const auto character = ParticipantForPeer(peer);
+            if (LivingCharacter(character)) {
+                candidates[count++] = {peer, character};
+            } else if (character != 0U && RegisteredPlayerRepresentation(character)) {
+                // A replicated player may temporarily have its activation
+                // flag cleared while its HP and native lifetime remain valid.
+                // Do not discard the only living spectate target on that flag
+                // alone; ParticipantForPeer already certified the incarnation.
+                std::uint16_t hp{};std::uint32_t health{};
+                if(Read(character+0x33CU,hp)&&hp!=0U&&Read(character+0x32CU,health)&&health<3U) {
+                    candidates[count++] = {peer, character};
+                    gSpectateFallbackCandidates.fetch_add(1U,std::memory_order_relaxed);
+                }
+            }
+        }
+        std::sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(count),
+            [](const auto& a, const auto& b) { return a.peer < b.peer; });
+    }
+    player_lifecycle::PumpSpectateOnEngineThread({gBase, LocalPlayer(), generation,
+        candidates.data(), count, cameraReserved});
 }
 void PumpOnEngineThread() noexcept {
     const profiling::Timer timing(profiling::Section::AiPump);
@@ -10168,6 +10518,8 @@ void PumpOnEngineThread() noexcept {
         localRequested?LocalPlayer():0U,
         static_cast<std::uint32_t>(pvpPhysicalGeneration),
         gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested});
+    PumpPlayerSpectate(static_cast<std::uint32_t>(pvpPhysicalGeneration),localRequested,
+        (gCurrent.flags & kAlienPvP)!=0U?gPvPLease.ownerPeer:0U);
     const auto pilot=alien_pvp_local::Snapshot();
     alien_pvp::Context pvp{};
     if(activeLease) {
@@ -10379,12 +10731,229 @@ void PumpOnEngineThread() noexcept {
             static_cast<void>(ApplyAuthoritativeParticipantDamage(actor, actor.desired));
             static_cast<void>(ApplyAuthoritativeCombat(actor, actor.desired, now));
         }
-    // Locomotion is exclusively CATHODE-owned. A failed path is observable;
-    // it never authorizes a transform, velocity motor or hidden catch-up snap.
+    // Host pose drives ordinary locomotion. Native actions (paired kills,
+    // passages, scripted reactions and terminal states) still own their cycles.
+    // The native follower supplies gait/footsteps; the POST pass commits the
+    // actual authoritative physics + visual transform after retail root motion.
     lock.unlock();
-    for(auto& actor:gActors)if(actor.character&&actor.recoveryNativeArmed) {
-        static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
-        actor.recoveryNativeArmed=false;actor.recoveryFollowing=false;
+    for(auto& actor:gActors) {
+        if(!actor.character || actor.duplicate || actor.faulted)continue;
+        const auto relinquish=[&]() noexcept {
+            ReleaseNativeFollow(actor);
+            if(actor.recoveryNativeArmed)
+                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+            actor.recoveryNativeArmed=actor.recoveryFollowing=false;
+            actor.directPoseDivergenceSince=0U;
+        };
+        std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
+        if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
+            !Read(actor.character+0x54U,liveEntityA)||liveEntityA!=actor.entityA||
+            !Read(actor.character+0x58U,liveEntityB)||liveEntityB!=actor.entityB) {
+            relinquish();continue;
+        }
+        if(!actor.remoteBirth || !actor.initialPlacementReady ||
+            actor.directPoseBirth!=actor.remoteBirth ||
+            gGeneration!=gGenerations->CurrentGeneration() ||
+            PvPCharacterFenced(actor.character) ||
+            ExecutionOwnedCharacter(actor.character) ||
+            PairReservedCharacter(actor.character) || PairSourceBusy(actor.character) ||
+            (actor.desired.executionFlags&ExecutionPaired)!=0U ||
+            (actor.received.executionFlags&ExecutionPaired)!=0U ||
+            ProxyWithdrawn(actor.desired)||ProxyWithdrawn(actor.recoveryPose) ||
+            health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health)) {
+            relinquish();continue;
+        }
+        hybrid_motion::Target target{};
+        if(!actor.directPoseTimeline.SampleAt(PreciseTickMs(),target) || target.stale ||
+            target.nativeAction || target.discontinuity) {
+            relinquish();continue;
+        }
+        const auto& state=actor.recoveryPose;
+        if(state.birth!=actor.remoteBirth || state.sessionCookie!=gCurrent.sessionCookie ||
+            state.worldGeneration!=gCurrent.worldGeneration ||
+            (state.stateFlags&PoseValid)==0U || state.moveType>3U) {
+            relinquish();continue;
+        }
+        if(kNativeFollowLocomotion) {
+            std::uintptr_t cycle{},table{};std::uint8_t cycleState{};
+            // Only an ordinary (idle/locomotion) cycle may be driven by a Move;
+            // reactions, scripts and interactions keep their own executor.
+            if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle,table)||table<gBase||
+                !Read(cycle+0x1AU,cycleState)||
+                !HybridLocomotionCycleAllowed(static_cast<std::uint32_t>(table-gBase),cycleState)) {
+                if(!actor.follow.object){relinquish();continue;}
+            }
+            if(actor.recoveryNativeArmed) {
+                static_cast<void>(character_direct_step_runtime::ReleaseAIIntentOwnership(actor.character));
+                actor.recoveryNativeArmed=actor.recoveryFollowing=false;
+            }
+            DriveNativeFollow(actor,target,state.moveType,GetTickCount64());
+            continue;
+        }
+        const float speed=std::hypot(target.velocity[0],target.velocity[2]);
+        std::string error;
+        if(!character_direct_step_runtime::ArmAIHybridReplication(
+            actor.character,target.velocity[0],target.velocity[2],
+            speed>0.02F?1.0F:0.0F,
+            target.position[0],target.position[1],target.position[2],
+            target.yaw,state.moveType,error,actor.recoveryPoseAt+hybrid_motion::kStaleAfterMs)) {
+            relinquish();continue;
+        }
+        actor.recoveryNativeArmed=actor.recoveryFollowing=true;
+    }
+}
+// The retail NPC motor owns ordinary frame-by-frame locomotion and animation.
+// Never teleport the physics body for centimetre-size interpolation errors:
+// forcing Character/registry pose after every retail step fights root motion,
+// resetting stride and producing visible Move/Idle hesitation. Authoritative
+// placement is a last-resort, sustained multi-metre recovery only.
+// Vent entry/exit clips (0x12) and passages (0x4B-0x4D) translate the Host
+// Alien by native root motion and its own passage driver, while the Client
+// replay of the same cycles stays in place (diag 213331: Host crossed 15-30 m
+// of vent; Client stayed at the mouth, played the exit clip there, then the
+// 3.5 m emergency snapped it 15.8/31.7 m right onto the player before a kill).
+// Carry the Client body along the Host pose for these non-paired actions.
+// Paired kills keep native alignment and are never touched here.
+bool FollowHostActionPose(Actor& actor) noexcept {
+    if(!actor.character||actor.duplicate||actor.faulted||!actor.initialPlacementReady||
+        !actor.remoteBirth||actor.directPoseBirth!=actor.remoteBirth||
+        PvPCharacterFenced(actor.character)||PairReservedCharacter(actor.character)||
+        PairSourceBusy(actor.character)||
+        (actor.desired.executionFlags&ExecutionPaired)!=0U||
+        (actor.received.executionFlags&ExecutionPaired)!=0U||
+        health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health))return false;
+    std::uintptr_t cycle{};std::uint8_t cycleState{};
+    if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,cycleState))return false;
+    const bool scripted=cycleState==0x12U;
+    const bool passage=cycleState==0x4BU||cycleState==0x4CU||cycleState==0x4DU;
+    // Any other Host-ordered native action (e.g. state 0x57) plays its own
+    // root motion on each PC; the Host body moved 1.5 m forward while the
+    // Client's went 1.3 m back (diag 074748). Locomotion (1/0x37/0x38/0x3B)
+    // stays with the direct motor; paired states are excluded above.
+    const bool locomotion=cycleState==1U||cycleState==0x37U||cycleState==0x38U||cycleState==0x3BU;
+    const bool action=!scripted&&!passage&&!locomotion&&cycleState!=0x4EU&&cycleState!=0x4FU;
+    if(!scripted&&!passage&&!action)return false;
+    std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
+    if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
+        !Read(actor.character+0x54U,liveEntityA)||liveEntityA!=actor.entityA||
+        !Read(actor.character+0x58U,liveEntityB)||liveEntityB!=actor.entityB)return true;
+    const auto& state=actor.recoveryPose;
+    if(state.birth!=actor.remoteBirth||state.sessionCookie!=gCurrent.sessionCookie||
+        state.worldGeneration!=gCurrent.worldGeneration||(state.stateFlags&PoseValid)==0U)return true;
+    hybrid_motion::Target target{};
+    if(!actor.directPoseTimeline.SampleAt(PreciseTickMs(),target)||target.stale)return true;
+    float local[3]{};
+    if(!Read(actor.character+kPositionOffset,local[0])||!Read(actor.character+kPositionOffset+4U,local[1])||
+        !Read(actor.character+kPositionOffset+8U,local[2]))return true;
+    const float dx=target.position[0]-local[0],dy=target.position[1]-local[1],dz=target.position[2]-local[2];
+    const float distance=std::sqrt(dx*dx+dy*dy+dz*dz);
+    // Generic actions keep their native root motion inside 0.25 m.
+    if(!std::isfinite(distance)||distance<(action?0.25F:0.03F))return true;
+    // Never jump the physics body over several metres in a single frame,
+    // even inside a vent. A delayed passage must approach at bounded steps;
+    // the old uncapped jump could materialize the Alien on a living survivor.
+    const float cap=passage?0.35F:(action?0.10F:0.15F);
+    const float scale=std::min(1.0F,cap/distance);
+    const float pose[3]{local[0]+dx*scale,local[1]+dy*scale,local[2]+dz*scale};
+    if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw))
+        gDirectPoseActionFollowFrames.fetch_add(1U,std::memory_order_relaxed);
+    return true;
+}
+void ReconcileDirectPoseOnEngineThread() noexcept {
+    if(!Installed()||!EngineThread()||!Stable()||!Client() ||
+        gGeneration!=gGenerations->CurrentGeneration())return;
+    constexpr float kEmergencyDistance=3.5F;
+    constexpr ULONGLONG kEmergencyDwellMs=750ULL;
+    constexpr ULONGLONG kEmergencyCooldownMs=3000ULL;
+    const auto now=PreciseTickMs();
+    for(auto& actor:gActors) {
+        if(FollowHostActionPose(actor))continue;
+        if(!actor.character||!actor.recoveryNativeArmed||!actor.recoveryFollowing||
+            !character_direct_step_runtime::Snapshot(actor.character).armed||
+            actor.duplicate||actor.faulted||!actor.initialPlacementReady||
+            actor.directPoseBirth!=actor.remoteBirth||PvPCharacterFenced(actor.character)||
+            ExecutionOwnedCharacter(actor.character)||PairSourceBusy(actor.character)||
+            PairReservedCharacter(actor.character)||
+            (actor.desired.executionFlags&ExecutionPaired)!=0U ||
+            (actor.received.executionFlags&ExecutionPaired)!=0U ||
+            ProxyWithdrawn(actor.desired)||ProxyWithdrawn(actor.recoveryPose)||
+            health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health)) {
+            actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
+        }
+        std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
+        if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
+            !Read(actor.character+0x54U,liveEntityA)||liveEntityA!=actor.entityA||
+            !Read(actor.character+0x58U,liveEntityB)||liveEntityB!=actor.entityB) {
+            actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
+        }
+        hybrid_motion::Target target{};
+        if(!actor.directPoseTimeline.SampleAt(PreciseTickMs(),target)||target.stale||
+            target.nativeAction||target.discontinuity) {
+            actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
+        }
+        const auto& state=actor.recoveryPose;
+        if(state.birth!=actor.remoteBirth||state.sessionCookie!=gCurrent.sessionCookie||
+            state.worldGeneration!=gCurrent.worldGeneration||
+            (state.stateFlags&PoseValid)==0U) {
+            actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
+        }
+        std::uintptr_t cycle{},table{};
+        std::uint8_t cycleState{};
+        if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle,table)||
+            table<gBase||!Read(cycle+0x1AU,cycleState)||
+            !HybridLocomotionCycleAllowed(static_cast<std::uint32_t>(table-gBase),cycleState)) {
+            actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
+        }
+        float local[3]{};
+        if(!Read(actor.character+kPositionOffset,local[0])||
+            !Read(actor.character+kPositionOffset+4U,local[1])||
+            !Read(actor.character+kPositionOffset+8U,local[2])) {
+            actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
+        }
+        const float dx=target.position[0]-local[0];
+        const float dy=target.position[1]-local[1];
+        const float dz=target.position[2]-local[2];
+        const float distance2=dx*dx+dy*dy+dz*dz;
+        // Kinematic tracking. Retail root motion often does not translate the
+        // Client Alien at all outside steady runs (diag 205545: measured speed
+        // 0 with demand 1-5 m/s). A dead-zone assist (516-520) made a sawtooth:
+        // stall to 0.20 m, burst at Host speed + 1.5 m/s back to 0.15 m, stall
+        // again, which read as stutter (diag 085355). The interpolated Host pose
+        // is already smooth (100 ms delay), so within 0.75 m the body is placed
+        // on it every frame; the native cycle keeps animating from the demand.
+        // Beyond that, approach at most Host speed + 3 m/s (0.30 m/frame).
+        constexpr float kTrackDistance=0.75F, kTrackEpsilon=0.005F, kCatchUpMaximumStep=0.30F;
+        const float frameSeconds=actor.directPoseAssistAt&&now>actor.directPoseAssistAt
+            ? std::min(static_cast<float>(now-actor.directPoseAssistAt)/1000.0F,0.05F) : 0.0F;
+        actor.directPoseAssistAt=now;
+        const float planar=std::sqrt(dx*dx+dz*dz);
+        const float spatial=std::sqrt(distance2);
+        if(std::isfinite(planar)&&std::isfinite(spatial)&&spatial>kTrackEpsilon&&
+            planar<kEmergencyDistance&&frameSeconds>0.0F) {
+            float scale=1.0F;
+            if(planar>kTrackDistance) {
+                const float hostSpeed=std::hypot(target.velocity[0],target.velocity[2]);
+                scale=std::min({1.0F,(hostSpeed+3.0F)*frameSeconds/planar,kCatchUpMaximumStep/planar});
+            }
+            const float pose[3]{local[0]+dx*scale,local[1]+dy*std::min(1.0F,scale*2.0F),local[2]+dz*scale};
+            if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw))
+                gDirectPoseAssistFrames.fetch_add(1U,std::memory_order_relaxed);
+        }
+        if(!std::isfinite(distance2)||distance2<kEmergencyDistance*kEmergencyDistance) {
+            actor.directPoseDivergenceSince=0U;continue;
+        }
+        if(!actor.directPoseDivergenceSince) {
+            actor.directPoseDivergenceSince=now;continue;
+        }
+        if(now-actor.directPoseDivergenceSince<kEmergencyDwellMs ||
+            (actor.directPoseLastEmergencyCorrection &&
+             now-actor.directPoseLastEmergencyCorrection<kEmergencyCooldownMs))continue;
+        const float pose[3]{target.position[0],target.position[1],target.position[2]};
+        if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw)) {
+            actor.directPoseLastEmergencyCorrection=now;
+            actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=0U;
+            gDirectPoseEmergencyCorrections.fetch_add(1U,std::memory_order_relaxed);
+        }
     }
 }
 void ObservePlayerRepresentationSpawn(const std::uint32_t spawnKey) noexcept {
@@ -11624,6 +12193,18 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"hostLastRefusedCycleCall", Diagnostics::Unsigned(gLastRefusedCycleCall.load()), true},
          {"hostCycleCallsPublished", Diagnostics::Unsigned(gCycleCallsPublished.load()), true},
          {"clientCycleCallsReplayed", Diagnostics::Unsigned(gCycleCallsReplayed.load()), true},
+         {"directLocomotionConstructorsConsumed", Diagnostics::Unsigned(gDirectLocomotionConstructorsConsumed.load()), true},
+         {"directPoseAssistFrames", Diagnostics::Unsigned(gDirectPoseAssistFrames.load()), true},
+         {"directPoseActionFollowFrames", Diagnostics::Unsigned(gDirectPoseActionFollowFrames.load()), true},
+         {"nativeFollowCreated", Diagnostics::Unsigned(gFollowCreated.load()), true},
+         {"nativeFollowCreateFailures", Diagnostics::Unsigned(gFollowCreateFailures.load()), true},
+         {"nativeFollowCompleted", Diagnostics::Unsigned(gFollowCompleted.load()), true},
+         {"nativeFollowCancelled", Diagnostics::Unsigned(gFollowCancelled.load()), true},
+         {"nativeFollowEmergencies", Diagnostics::Unsigned(gFollowEmergencies.load()), true},
+         {"nativeFollowDivergenceReplans", Diagnostics::Unsigned(gFollowDivergenceReplans.load()), true},
+         {"spectateFallbackCandidates", Diagnostics::Unsigned(gSpectateFallbackCandidates.load()), true},
+         {"nativeFollowIdleTurns", Diagnostics::Unsigned(gFollowIdleTurns.load()), true},
+         {"directPoseEmergencyCorrections", Diagnostics::Unsigned(gDirectPoseEmergencyCorrections.load()), true},
          {"clientCycleCallsReplayFailed", Diagnostics::Unsigned(gCycleCallsReplayFailed.load()), true},
          {"endedSourceExitsDeferred", Diagnostics::Unsigned(gEndedSourceExitsDeferred.load()), true},
          {"localVictimEndRetained", Diagnostics::Unsigned(gLocalVictimEndRetained.load()), true},
@@ -12013,6 +12594,9 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"impactRejected", Diagnostics::Unsigned(ai.impactRejected), true},
          {"impactShooterRemaps", Diagnostics::Unsigned(ai.impactShooterRemaps), true},
          {"impactShooterUnresolved", Diagnostics::Unsigned(ai.impactShooterUnresolved), true},
+         {"impactStimulusForwarded", Diagnostics::Unsigned(gImpactStimulusForwarded.load()), true},
+         {"impactStimulusApplied", Diagnostics::Unsigned(gImpactStimulusApplied.load()), true},
+         {"impactDamagelessDropped", Diagnostics::Unsigned(gImpactDamagelessDropped.load()), true},
          {"withdrawSamples", Diagnostics::Unsigned(ai.withdrawSamples), true},
          {"withdrawTransitions", Diagnostics::Unsigned(ai.withdrawTransitions), true},
          {"withdrawApplied", Diagnostics::Unsigned(ai.withdrawApplied), true},

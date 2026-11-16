@@ -43,7 +43,11 @@ struct State final {
 [[nodiscard]] inline float PosturalHeightOffset(float baseline, float ownerStartY, float ownerY) noexcept {
     if (!std::isfinite(baseline) || !std::isfinite(ownerStartY) || !std::isfinite(ownerY)) return baseline;
     const auto delta = ownerStartY - ownerY;
-    const auto distance = std::abs(delta);
+    // Only a lowered first-person body is posture. Rising is real travel
+    // (climbing into a vent, onto a step): holding the start height sank the
+    // representation into the vent floor.
+    if (delta <= 0.0F) return baseline;
+    const auto distance = delta;
     // Smoothly fade compensation; the old 25-cm switch jerked the visible
     // character during first-person locker leaning.
     if (distance <= 0.35F) return baseline + delta;
@@ -51,6 +55,11 @@ struct State final {
     return baseline + delta * ((0.75F - distance) / 0.40F);
 }
 inline constexpr std::uint32_t kMaximumElapsedMilliseconds = 60000U;
+// The alias under which the launcher's ANIMATION.PAK patch gives every crew
+// representation the player's exact clip for a player alias: a crew database
+// often has its own, different clip under the same alias (vents, ...).
+// Mirrors RemoteCrouchAnimationInstaller.ReplayAlias.
+[[nodiscard]] constexpr std::uint32_t ReplayAlias(const std::uint32_t alias) noexcept { return alias ^ 0xA1B5C0DEU; }
 inline bool Active(const State& value) noexcept { return value.transition != 0U; }
 inline bool Valid(const State& value) noexcept {
     if (!Active(value)) return value == State{};

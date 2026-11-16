@@ -34,6 +34,10 @@ struct Lease {
     std::uint8_t actionState{},actionSerial{};
     bool actionKnown{},actionRevoked{};
     bool used{}, submitted{}, unknown{}, primaryAccepted{}, companionAccepted{}, producerActive{}, admissionActive{};
+    // Every Ref in this lease was acquired by a successful Strong(). A fenced
+    // (unknown) lease of the live world whose Refs are all exactly held can be
+    // retired like a live one; a world fence or a failed decrement cannot.
+    bool refsHeld{}, worldFenced{};
 };
 struct MoveFrame {
     std::uintptr_t character{},state{},primary{};
@@ -116,10 +120,13 @@ bool CancelNative(std::uintptr_t request) noexcept {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool ReleaseRef(Ref& ref) noexcept {
+    // A Ref whose decrement already faulted is poisoned (control=0) and is
+    // never decremented again.
+    if (!ref.control) return false;
     __try {
         reinterpret_cast<void(__thiscall*)(Ref*)>(gBase + 0xD770U)(&ref);
         ref = {}; return true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { ref.control = 0; return false; }
 }
 bool Snapshot(std::uintptr_t request, std::uintptr_t& character, std::uint32_t& runtime, Command& p) noexcept {
     std::uintptr_t scheduler{}, type{};
@@ -186,6 +193,9 @@ bool SnapshotGait(std::uintptr_t character,std::uint32_t& gait) noexcept {
     std::uintptr_t movement{};return Read(character+0x42A8,movement)&&movement&&Read(movement+0x194,gait)&&gait<=3;
 }
 Lease* Find(std::uintptr_t request) noexcept {
+    // A null request never names a lease: every lease without a companion has
+    // companion.object==0, so Find(0) used to return an arbitrary live lease.
+    if (!request) return nullptr;
     for (auto& item : gLeases) if (item.used && (item.ref.object == request || item.companion.object == request)) return &item;
     return nullptr;
 }
@@ -198,6 +208,10 @@ bool Live(Lease& lease) noexcept {
         Read(lease.ref.control + 4,strong) && strong != 0 &&
         (!lease.companion.object||(Read(lease.companion.control+4,strong)&&strong!=0));
 }
+bool RecoverableFence(const Lease& lease) noexcept {
+    return lease.unknown && lease.refsHeld && !lease.worldFenced && lease.ref.object && lease.ref.control &&
+        (!lease.companion.object || lease.companion.control);
+}
 Lease* Capture(std::uintptr_t request) noexcept {
     if (auto* lease = Find(request)) return lease;
     if (!gInstalled || !gGuard || !gGuard() || !EngineProducer().Bound()) return nullptr;
@@ -208,14 +222,13 @@ Lease* Capture(std::uintptr_t request) noexcept {
     std::uintptr_t scheduler{}; std::uint32_t kind{};
     if (!Read(request + 0x14,scheduler) || !Read(scheduler,character) ||
         scheduler != character + 0x2CD0U || !gContext(character,owner)) return nullptr;
-    if(Read(request+0x10,kind)&&(kind==1||kind==3)) {
-        // Only a bracketed producer plus pre-admission evidence can construct
-        // a Move bundle. A Move admitted while the source was unbound is not
-        // reconstructed: BootstrapNativeActor cancels it so the brain reissues
-        // a fully observed one. It never closes the other actors' stream.
-        gUncoveredKinds[kind].fetch_add(1U,std::memory_order_relaxed);
-        return nullptr;
-    }
+    // StatusDetour and ObserveNativeAdmission can capture a request even if
+    // BeforeNativeAdmission declined it. Suppress all ordinary navigation at
+    // this central fallback too, not just the pre-admission hook. Otherwise
+    // status1/2 recreates a command lease and restarts Client pathfinding.
+    if(!Read(request+0x10,kind) ||
+       kind==1U||kind==2U||kind==3U||kind==4U||kind==6U||
+       kind==7U||kind==8U||kind==9U||kind==11U)return nullptr;
     if(kind==execution::kPlacementKind&&(!execution::PlacementDedupReady()||
         (EngineProducer().Profiles()&execution::kProfilePlacement)==0)) {
         gUncoveredKinds[kind].fetch_add(1U,std::memory_order_relaxed);return nullptr;
@@ -242,6 +255,7 @@ Lease* Capture(std::uintptr_t request) noexcept {
     lease->order=++gAdmissionOrder;
     lease->character = character; lease->runtime = runtime; lease->parameters = parameters;
     if (!Strong(request,lease->ref)) { lease->unknown = true; Lost(__LINE__); return nullptr; }
+    lease->refsHeld = true;
     if (!Live(*lease)) {
         lease->unknown = true; Lost(__LINE__); return nullptr;
     }
@@ -571,6 +585,12 @@ void BeginNativeMove(std::uintptr_t character,std::uintptr_t state) noexcept {
 void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexcept {
     if(!gInstalled||!gGuard||!gGuard()||!EngineProducer().Bound())return;
     std::uint32_t kind{};if(!Read(request+0x10,kind))return;
+    // Direct NPC locomotion: do not publish local pathfinding, steering,
+    // placement or scheduler hold instructions to clients. They are per-brain
+    // decisions and can never converge spatially. Kind 5 (native action) and
+    // all observed state/passage/lifecycle events keep their ordered channel.
+    if(kind==1U||kind==2U||kind==3U||kind==4U||kind==6U||
+       kind==7U||kind==8U||kind==9U||kind==11U)return;
     std::uintptr_t scheduler{},character{};transactions::OwnerKey owner{};
     if(!Read(request+0x14,scheduler)||!Read(scheduler,character)||scheduler!=character+0x2CD0||!gContext(character,owner))return;
     if(admission>2){Lost(__LINE__);return;}
@@ -593,9 +613,11 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
         lease->parameters.movement.navigation=movement::Navigation::HostRoute;
         if(gAdmissionOrder==UINT64_MAX){lease->unknown=true;Lost(__LINE__,execution::Recovery::Capacity);return;}
         lease->order=++gAdmissionOrder;
-        if(!HostScope(lease->scope)||!Read(character+0x50,lease->runtime)||!Strong(request,lease->ref)||!Live(*lease)) {
-            lease->unknown=true;Lost(__LINE__);
+        if(!HostScope(lease->scope)||!Read(character+0x50,lease->runtime)||!Strong(request,lease->ref)) {
+            lease->unknown=true;Lost(__LINE__);return;
         }
+        lease->refsHeld=true;
+        if(!Live(*lease)){lease->unknown=true;Lost(__LINE__);}
         return;
     }
     if(kind==4||kind==7||kind==execution::kActionKind||kind==execution::kPlacementKind||kind==execution::kDirectedKind||scheduler_control::Supported(kind)) {
@@ -629,9 +651,11 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
         // must wait/fail through the route barrier rather than solve locally.
         b.navigation=movement::Navigation::HostRoute;
         if(!HostScope(lease->scope)||!Read(character+0x50,lease->runtime)||
-            !SnapshotMovement(request,kind,b.before,false)||!Strong(request,lease->ref)||!Live(*lease)) {
+            !SnapshotMovement(request,kind,b.before,false)||!Strong(request,lease->ref)) {
             lease->unknown=true;Lost(__LINE__);return;
         }
+        lease->refsHeld=true;
+        if(!Live(*lease)){lease->unknown=true;Lost(__LINE__);return;}
         if(kind==3) {
             std::uint8_t flags{};
             if(!Read(request+0xB8,flags)){lease->unknown=true;Lost(__LINE__);return;}
@@ -644,9 +668,11 @@ void BeforeNativeAdmission(std::uintptr_t request,std::uint32_t admission) noexc
         // primary, which BootstrapNativeActor cancels.
         if(!lease&&frame&&!frame->primary){gUncoveredKinds[3].fetch_add(1U,std::memory_order_relaxed);return;}
         if(admission!=1||!lease||lease->unknown||lease->companion.object||!Live(*lease)||
-            !SnapshotMovement(request,3,lease->parameters.movement.companion,false)||!Strong(request,lease->companion)||!Live(*lease)) {
+            !SnapshotMovement(request,3,lease->parameters.movement.companion,false)) {
             if(lease)lease->unknown=true;Lost(__LINE__);return;
         }
+        if(!Strong(request,lease->companion)){lease->refsHeld=false;lease->unknown=true;Lost(__LINE__);return;}
+        if(!Live(*lease)){lease->unknown=true;Lost(__LINE__);return;}
         lease->parameters.movement.parts=2;
         lease->admissionActive=true;
         std::uint8_t flags{};
@@ -661,6 +687,7 @@ void EndNativeMove() noexcept {
     const auto frame=gMoveFrames[--gMoveDepth];gMoveFrames[gMoveDepth]={};
     if(!frame.bound||!gGuard||!gGuard())return;
     auto* lease=Find(frame.primary);if(!lease)return;
+    if(lease->parameters.kind!=1&&lease->parameters.kind!=2&&lease->parameters.kind!=3)return;
     // The Move frame has returned even when a recovery unbound the source in
     // between. Leaving this frame bit set made RetireNative skip the lease
     // forever, so the next authority Offer could never qualify (Host stream
@@ -825,7 +852,10 @@ void RetireNative(bool liveWorld, bool retireSource) noexcept {
     // Never chase an old Character after a world barrier. An unresolved Ref
     // remains visible and prevents a new source from claiming clean coverage.
     for (auto& lease : gLeases) if (lease.used) {
-        if (!liveWorld || lease.unknown) { lease.unknown = true; continue; }
+        if (!liveWorld) { lease.unknown = true; lease.worldFenced = true; continue; }
+        // Only this top-level engine-tick path recovers a same-world fence:
+        // a destructor reentering mid-decrement would still see control!=0.
+        if (lease.unknown && !RecoverableFence(lease)) continue;
         if(lease.producerActive||lease.admissionActive)continue;
         if (!gRetirementGuard || !gRetirementGuard(lease.scope,lease.owner,lease.character,lease.runtime)) continue;
         const character_direct_step_runtime::MovementResourceLease resources(lease.character);
@@ -845,7 +875,10 @@ bool NativeNeedsLiveWorldRetirement() noexcept {
     // A retained old-world strong Ref is *not* a live request. Calling
     // RetireHost for it every frame clears the new Pending Offer before
     // PumpHost can configure the next world, so no Ready can ever be sent.
-    for(const auto& lease:gLeases)if(lease.used&&!lease.unknown)return true;
+    // A same-world capture fence whose Refs are exactly held still needs (and
+    // allows) retirement: otherwise one capture failure silences the Host
+    // source for the rest of the round (diag 054751, loss site 339).
+    for(const auto& lease:gLeases)if(lease.used&&(!lease.unknown||RecoverableFence(lease)))return true;
     return false;
 }
 // A world transition retires the source BEFORE the prior CATHODE requests

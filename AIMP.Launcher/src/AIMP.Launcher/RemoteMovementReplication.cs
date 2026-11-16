@@ -50,6 +50,12 @@ internal sealed class RemotePositionTrack
     private const float DirectionSmoothing = 1.00F;
     private const int StationarySamplesToStop = 4;
     private const float DiscontinuityDistance = 2.0F;
+    // Velocity is measured over a ~100 ms window of source samples. Per-sample
+    // differences use millisecond UTC stamps (~16 ms steps) and swung by 2x.
+    private const long VelocityWindowMinimumMilliseconds = 80;
+    private const long VelocityWindowMaximumMilliseconds = 250;
+    private const int VelocityHistoryCapacity = 32;
+    private readonly Queue<(long SentAt, float X, float Z)> _velocityHistory = new();
 
     private PlayerPositionSnapshotPayload? _previous;
     private PlayerPositionSnapshotPayload? _latest;
@@ -203,6 +209,7 @@ internal sealed class RemotePositionTrack
         var step = Length(stepX, stepZ);
         _remoteStepDistance = step;
         if (!IsContinuousStep(step)) { ResetObservedMotion(); return; }
+        RecordVelocitySample(latest);
         if (step >= MovementThreshold())
         {
             ObserveMovement(stepX, stepZ, previous, latest, previousReceivedAtUtc, receivedAtUtc);
@@ -248,6 +255,11 @@ internal sealed class RemotePositionTrack
         DateTimeOffset previousReceivedAtUtc,
         DateTimeOffset receivedAtUtc)
     {
+        if (TryWindowVelocity(latest, out var windowX, out var windowZ))
+        {
+            ApplyVelocity(windowX, windowZ);
+            return;
+        }
         var seconds = SampleSeconds(previous, latest, previousReceivedAtUtc, receivedAtUtc);
         if (seconds <= 0F) return;
         var velocityX = stepX / seconds;
@@ -280,6 +292,42 @@ internal sealed class RemotePositionTrack
             : 1F;
     }
 
+    private void RecordVelocitySample(PlayerPositionSnapshotPayload latest)
+    {
+        if (_velocityHistory.Count > 0 && latest.SentAtUnixMilliseconds <= LastVelocitySampleTime())
+            return;
+        _velocityHistory.Enqueue((latest.SentAtUnixMilliseconds, latest.X, latest.Z));
+        while (_velocityHistory.Count > VelocityHistoryCapacity ||
+            (_velocityHistory.Count > 1 && latest.SentAtUnixMilliseconds - _velocityHistory.Peek().SentAt
+                > VelocityWindowMaximumMilliseconds))
+            _velocityHistory.Dequeue();
+    }
+
+    private long LastVelocitySampleTime()
+    {
+        long last = 0;
+        foreach (var sample in _velocityHistory) last = sample.SentAt;
+        return last;
+    }
+
+    private bool TryWindowVelocity(PlayerPositionSnapshotPayload latest, out float velocityX, out float velocityZ)
+    {
+        velocityX = velocityZ = 0F;
+        (long SentAt, float X, float Z)? origin = null;
+        foreach (var sample in _velocityHistory)
+        {
+            var age = latest.SentAtUnixMilliseconds - sample.SentAt;
+            if (age < VelocityWindowMinimumMilliseconds) break;
+            origin = sample;
+        }
+        if (origin is not { } start) return false;
+        var seconds = (latest.SentAtUnixMilliseconds - start.SentAt) / 1000F;
+        if (seconds <= 0F) return false;
+        velocityX = (latest.X - start.X) / seconds;
+        velocityZ = (latest.Z - start.Z) / seconds;
+        return float.IsFinite(velocityX) && float.IsFinite(velocityZ);
+    }
+
     private static float SampleSeconds(
         PlayerPositionSnapshotPayload previous,
         PlayerPositionSnapshotPayload latest,
@@ -294,6 +342,7 @@ internal sealed class RemotePositionTrack
 
     private void ResetObservedMotion()
     {
+        _velocityHistory.Clear();
         _observedMoving = false;
         _stationarySamples = 0;
         _estimatedVelocityX = 0F;
@@ -334,6 +383,7 @@ internal static class RemoteMovementPlanner
     internal static readonly TimeSpan OrientationHeartbeat = TimeSpan.FromMilliseconds(33);
 
     internal const float BaseWalkIntensity = 1.100F;
+    private const float MaximumReplicatedSpeed = 8.0F;
     // Fallback only. v10.4 reads the retail source Character's requested
     // move_type and its own +0x4C speed table instead of assuming WALK.
     internal const float LegacyWalkFallbackMagnitude = 1.15073F;
@@ -364,8 +414,13 @@ internal static class RemoteMovementPlanner
         var motionX = track.EstimatedVelocityX / velocityLength;
         var motionZ = track.EstimatedVelocityZ / velocityLength;
         var nativeMoveSpeed = track.Latest.NativeMoveSpeed;
-        var directionX = motionX * nativeMoveSpeed;
-        var directionZ = motionZ * nativeMoveSpeed;
+        // Travel at the source's measured speed. The NPC gait table (3.45 m/s
+        // FastWalk) is slower than a sprinting player: the Host replica fell
+        // >1.5 m behind and was teleported 7 times in 30 s (diag 182335).
+        var speed = float.IsFinite(velocityLength) && velocityLength > 0.05F
+            ? Math.Clamp(velocityLength, 0.25F, MaximumReplicatedSpeed) : nativeMoveSpeed;
+        var directionX = motionX * speed;
+        var directionZ = motionZ * speed;
         var action = ShouldDispatchMove(track, directionX, directionZ, now)
             ? RemoteMovementAction.Move : RemoteMovementAction.None;
         return new(action, directionX, directionZ, BaseWalkIntensity,

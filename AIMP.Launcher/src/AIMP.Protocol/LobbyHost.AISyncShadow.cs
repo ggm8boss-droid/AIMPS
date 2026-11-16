@@ -4,7 +4,7 @@ public sealed partial class LobbyHost
 {
     private const int ShadowOutboxRecords = 2048;
     private const int ShadowOutboxBytes = 2 * 1024 * 1024;
-    private static readonly TimeSpan ShadowSendTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ShadowSendTimeout = TimeSpan.FromSeconds(10); // peer-timeout parity: a cancelled write drops the peer
     private readonly Dictionary<ulong, ShadowPeer> _shadowPeers = new();
     private AISyncShadowJournal? _shadowJournal;
     private AISyncShadowStreamId _shadowStream;

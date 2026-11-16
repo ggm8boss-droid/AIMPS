@@ -45,7 +45,7 @@ bool SupersedesNativePassage(const NativeExecutionAnchor& anchor,std::uint64_t s
         record.nativeKind==kFrontstageKind||(record.nativeKind==kBackstageKind&&record.mode==0U);
 }
 static OwnershipCheck InspectBoundary(const OwnershipMemory& inputMemory,const ActorLifetime& inputActor,bool quiet,
-    bool interaction,OwnershipBoundaryFailure* failure,bool initialBackstage=false) noexcept {
+    bool interaction,OwnershipBoundaryFailure* failure,bool initialBackstage=false,bool possession=false) noexcept {
     if(failure)*failure={};
     const auto memory=inputMemory;
     const auto actor=inputActor;
@@ -59,7 +59,9 @@ static OwnershipCheck InspectBoundary(const OwnershipMemory& inputMemory,const A
         !Read(memory,cycle,type)||!Read(memory,cycle+0x19U,serial)||!Read(memory,cycle+0x1AU,state)||
         !Read(memory,actor.character+0x297U,grappled)||!Read(memory,actor.character+0x32CU,health))
         return OwnershipCheck::Unknown;
-    bool cycleAllowed=type>=memory.imageBase&&MovementDrainCycleAllowed(type-memory.imageBase,state);
+    bool cycleAllowed=type>=memory.imageBase&&(possession&&!initialBackstage?
+        AlienPossessionDrainCycleAllowed(type-memory.imageBase,state):
+        MovementDrainCycleAllowed(type-memory.imageBase,state));
     // 00401520 constructs a timed stationary hold. 00401580 destroys only
     // its base cycle; unlike75/76 it owns no traversal path/listener. Drain
     // the scheduler normally and leave this cycle to the next Host constructor.
@@ -121,7 +123,7 @@ OwnershipCheck InspectAlienPossessionBoundary(const OwnershipMemory& memory,cons
     if(failure)*failure={};
     std::uint8_t a{},b{};
     if(!Read(memory,actor.character+0x2DAU,a)||!Read(memory,actor.character+0x2DBU,b))return OwnershipCheck::Unknown;
-    return InspectBoundary(memory,actor,quiet,false,failure,a!=0U||b!=0U);
+    return InspectBoundary(memory,actor,quiet,false,failure,a!=0U||b!=0U,true);
 }
 OwnershipCheck InspectInteractionBoundary(const OwnershipMemory& memory,const ActorLifetime& actor,
     OwnershipBoundaryFailure* failure) noexcept {return InspectBoundary(memory,actor,false,true,failure);}
