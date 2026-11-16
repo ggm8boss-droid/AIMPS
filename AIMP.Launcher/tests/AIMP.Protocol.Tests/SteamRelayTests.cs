@@ -216,6 +216,27 @@ internal static class SteamRelayTests
         AssertEx.Equal(0UL, relay.LocalSteamId);
     }
 
+    // Facepunch 2.3.3 ConnectionInfo.Identity returns the address, so Friends Only
+    // lobbies saw every joiner as SteamID 0 and refused them (client: "App_Min").
+    internal static Task ConnectionInfoIdentityAsync()
+    {
+        const ulong friend = 76561198000000002;
+        const BindingFlags fields = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+        AssertEx.True(SteamConnectionInfo.IsSupported, "Facepunch ConnectionInfo layout changed; review SteamConnectionInfo.");
+        object boxed = default(Steamworks.Data.ConnectionInfo);
+        var type = typeof(Steamworks.Data.ConnectionInfo);
+        type.GetField("identity", fields)!.SetValue(boxed, (Steamworks.Data.NetIdentity)new Steamworks.SteamId { Value = friend });
+        type.GetField("endReason", fields)!.SetValue(boxed, 1000);
+        type.GetField("endDebug", fields)!.SetValue(boxed, "not a Steam friend and the lobby is Friends");
+        var info = (Steamworks.Data.ConnectionInfo)boxed;
+
+        AssertEx.Equal(friend, SteamConnectionInfo.RemoteSteamId(info).Value, "remote SteamID read from the identity field");
+        AssertEx.Equal("host refused the connection: not a Steam friend and the lobby is Friends", SteamRelay.DescribeHostClose(info));
+        AssertEx.Equal(0UL, SteamConnectionInfo.RemoteSteamId(default).Value);
+        AssertEx.Equal("Invalid", SteamRelay.DescribeHostClose(default));
+        return Task.CompletedTask;
+    }
+
     private sealed class FakeRelay : ISteamRelay
     {
         public event Action<string, string>? JoinRequested;

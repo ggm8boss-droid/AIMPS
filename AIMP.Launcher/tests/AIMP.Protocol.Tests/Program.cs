@@ -15,6 +15,7 @@ internal static class Program
         new("Steam relay waits for ready menu and reactivates after game restart", SteamRelayTests.MenuActivationAsync),
         new("Steam relay gameplay does not activate Spacewar", SteamRelayTests.GameplayDoesNotActivateAsync),
         new("Steam relay worker waits for menu activation", SteamRelayTests.WorkerWaitsForMenuAsync),
+        new("Steam relay reads the joining SteamID and host refusal reason", SteamRelayTests.ConnectionInfoIdentityAsync),
         new("Local API origin and loopback policy", LocalApiSecurityTests.AccessPolicyAsync),
         new("Local API HTTP security boundary", LocalApiSecurityTests.HttpBoundaryAsync),
         new("WorldSync bounded dispatch pipeline", WorldDispatchWindowTests.CapacityAndOrderAsync),

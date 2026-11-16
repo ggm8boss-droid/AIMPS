@@ -125,6 +125,7 @@ internal sealed partial class SteamRelay
         lock (_gate) hosted = _tunnels.Count(tunnel => tunnel.ClientManager is null);
         if (hosted >= MaxHostTunnels) return "too many relay connections";
         if (_lobbyVisibility == SteamLobbyVisibility.Public) return null;
+        if (peer.Value == 0) return $"Steam did not report the player's SteamID and the lobby is {_lobbyVisibility}";
         return new Friend(peer).IsFriend ? null : $"not a Steam friend and the lobby is {_lobbyVisibility}";
     }
 

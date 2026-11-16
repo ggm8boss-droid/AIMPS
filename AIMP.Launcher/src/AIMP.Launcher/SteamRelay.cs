@@ -423,10 +423,11 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
     // Host side: called on the pump thread from HostRelaySocket callbacks.
     private void OnHostConnected(Connection connection, ConnectionInfo info)
     {
-        var tunnel = new RelayTunnel(this, connection, $"peer {info.Identity.SteamId.Value}");
+        var peer = SteamConnectionInfo.RemoteSteamId(info).Value;
+        var tunnel = new RelayTunnel(this, connection, $"peer {peer}");
         connection.UserData = tunnel.Id;
         Track(tunnel);
-        _diagnostics.Log("Steam", $"Steam relay peer {info.Identity.SteamId.Value} connected; bridging to lobby port {_hostPort}.");
+        _diagnostics.Log("Steam", $"Steam relay peer {peer} connected; bridging to lobby port {_hostPort}.");
         tunnel.SteamConnected.TrySetResult();
         var port = _hostPort;
         _ = Task.Run(() => BridgeToLobbyAsync(tunnel, port));
@@ -458,7 +459,8 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
 
         public override void OnConnecting(Connection connection, ConnectionInfo info)
         {
-            var peer = info.Identity.SteamId;
+            // Not info.Identity: Facepunch 2.3.3 returns the address there (always SteamID 0).
+            var peer = SteamConnectionInfo.RemoteSteamId(info);
             if (Owner?.RejectPeer(peer) is { } reason)
             {
                 Owner._diagnostics.Log("Steam", $"Rejected Steam relay peer {peer.Value}: {reason}.");
@@ -498,13 +500,23 @@ internal sealed partial class SteamRelay : ISteamRelay, ISteamLobbies
 
         public override void OnDisconnected(ConnectionInfo info)
         {
-            Tunnel?.SteamConnected.TrySetException(new IOException($"Steam relay refused: {info.EndReason}"));
-            Tunnel?.Close($"Steam host left ({info.EndReason})", closeSteam: false);
+            var reason = DescribeHostClose(info);
+            Tunnel?.SteamConnected.TrySetException(new IOException($"Steam relay refused: {reason}"));
+            Tunnel?.Close($"Steam host left ({reason})", closeSteam: false);
             base.OnDisconnected(info);
         }
 
         public override void OnMessage(IntPtr data, int size, long messageNum, long recvTime, int channel) =>
             Tunnel?.DeliverFromSteam(data, size);
+    }
+
+    // An application close (App_Min..App_Max) carries the host's own reason text,
+    // e.g. "not a Steam friend and the lobby is Friends"; show it instead of "App_Min".
+    internal static string DescribeHostClose(ConnectionInfo info)
+    {
+        var code = (int)info.EndReason;
+        var debug = SteamConnectionInfo.EndDebug(info);
+        return code is >= 1000 and <= 1999 && debug.Length > 0 ? $"host refused the connection: {debug}" : info.EndReason.ToString();
     }
 
     /// <summary>One Steam connection bridged to one loopback TCP connection.</summary>
