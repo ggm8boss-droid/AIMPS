@@ -24,6 +24,27 @@ internal sealed class LauncherDiagnostics : IDisposable
             FileShare.Read | FileShare.Delete);
         _writer = new StreamWriter(stream, new UTF8Encoding(false), 32 * 1024) { AutoFlush = false };
         Log("Launcher", "Launcher diagnostics started.");
+        RetentionTask = Task.Run(() => ApplyRetention(root));
+    }
+
+    /// <summary>Completes once old logs have been compressed and pruned.</summary>
+    internal Task RetentionTask { get; }
+
+    private void ApplyRetention(string root)
+    {
+        try
+        {
+            var result = LogRetention.Apply(root, Path);
+            if (result.Compressed + result.Deleted + result.Skipped > 0)
+                Log("Launcher", $"Log retention: compressed={result.Compressed}, " +
+                    $"deleted={result.Deleted}, skipped={result.Skipped}, " +
+                    $"keep={LogRetention.MaximumFilesPerKind} per kind.");
+        }
+        catch (Exception exception)
+        {
+            try { Log("Launcher", $"Log retention failed: {exception.Message}"); }
+            catch (ObjectDisposedException) { }
+        }
     }
 
     internal string Path { get; }

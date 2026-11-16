@@ -5,6 +5,7 @@ const http = require('node:http');
 const path = require('node:path');
 const { createApiSecurity } = require('./api-security');
 const { runStartupUpdate } = require('./startup-updater');
+const { rotateLogs } = require('./log-rotation');
 
 const API_URL = 'http://127.0.0.1:5127';
 const API_HEALTH_URL = `${API_URL}/`;
@@ -362,6 +363,9 @@ if (!singleInstance) {
 
   app.whenReady().then(async () => {
     try {
+      // Roll oversized logs before this session writes to them; compression
+      // and pruning of the rolled copies continue in the background.
+      rotateLogs([electronLogPath(), apiLogPath()], { log: logElectron });
       logElectron(`Desktop launcher starting: version=${app.getVersion()}; executable=${process.execPath}`);
       const updateOutcome = await runStartupUpdate({ app, BrowserWindow, log: logElectron });
       if (updateOutcome !== 'continue') return;

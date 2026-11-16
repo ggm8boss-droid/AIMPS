@@ -26,6 +26,7 @@
       "preload.js",
       "api-security.js",
       "startup-updater.js",
+      "log-rotation.js",
       "update.html",
       "package.json"
     ],

@@ -217,6 +217,20 @@ The API accepts connections from loopback addresses with a loopback `Host` only.
 
 Browser requests must also use the exact HTTP/HTTPS origin supplied in `AIMP_FRONTEND_ORIGIN`; Electron sets it from its configured frontend URL. Opaque (`null`), `file:`, `app:`, and other origins receive HTTP 403 before any controller runs. Browser requests without `Origin` that carry fetch metadata or a referrer are also denied. Native clients, including Electron health/shutdown calls, require the same session token. Missing or invalid tokens receive HTTP 401; a missing or malformed startup token prevents the API from starting. Standalone development requires a random 32-byte hex `AIMP_API_TOKEN` and the intended frontend origin, with the token supplied in each client request header. Deploy the matching Electron and API versions together; the previous desktop client cannot authenticate to this API.
 
+### Log files and retention
+
+| Location                                         | Files                                                                                                  |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `%LOCALAPPDATA%\AIMP\logs`                       | One file per run: `AIMP.Launcher-*`, `AIMP.NetZ-*`, `AIMP.Crash-*`, `AIMP.WS3.*`, `AIMP.RemoteLocomotionFlight-*` |
+| `%APPDATA%\aimp-launcher-desktop\logs`           | Appended across runs: `aimp-electron.log`, `aimp-launcher-api.log`                                      |
+
+Logs are bounded automatically at launcher startup:
+
+- **Per-run logs** (`%LOCALAPPDATA%\AIMP\logs`): every finished log is gzipped to `<name>.gz`, and only the newest 10 files of each kind are kept. Logs still open by a running game or launcher are never touched, so the current session's logs stay as plain text for **Export Diagnostics**.
+- **Electron logs**: once a log reaches 1 MiB it is renamed to `<name>.<UTC time>.log`, a fresh file is started, and the rolled copy is gzipped. The newest 10 archives of each log are kept.
+
+Compression is lossless: the original is deleted only after its `.gz` decompresses back to identical bytes (SHA-256 and length for per-run logs, byte comparison for Electron logs); otherwise the original is kept. `.gz` files open in 7-Zip, WinRAR, or `tar -xzf`.
+
 ## Developer Mode
 
 Developer Mode exposes experimental tools for testing **other maps** and investigating **multiplayer support for the main campaign**, beyond the currently supported Survivor Mode.
