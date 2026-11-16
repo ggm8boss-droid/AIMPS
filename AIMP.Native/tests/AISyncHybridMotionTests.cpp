@@ -55,7 +55,7 @@ void EmptyAndReset() {
     static_assert(noexcept(Timeline{}.SampleAt(0, std::declval<Target&>())));
     static_assert(noexcept(Timeline{}.Reset()));
     Timeline timeline;
-    Target unchanged{{1, 2, 3}, {4, 5, 6}, 2, 7, true, true};
+    Target unchanged{{1, 2, 3}, {4, 5, 6}, 2, 7, true, true, true};
     CHECK(timeline.Count() == 0 && !timeline.SampleAt(0, unchanged));
     CHECK(unchanged.position[0] == 1 && unchanged.velocity[0] == 4 &&
         unchanged.yaw == 2 && unchanged.tick == 7 && unchanged.nativeAction && unchanged.stale);
@@ -74,32 +74,34 @@ void ClocksAndInterpolation() {
         Timeline timeline;
         CHECK(timeline.Push(Motion(hostStarts[i], 0), localStarts[i]));
         CHECK(timeline.Push(Motion(hostStarts[i] + 100, 1), localStarts[i] + 100));
-        auto target = At(timeline, localStarts[i] + 100);
+        // 100 ms interpolation delay.
+        auto target = At(timeline, localStarts[i] + 150);
         CHECK(target.tick == hostStarts[i] + 50 && Near(target.position[0], .5F));
         CHECK(Near(target.velocity[0], 10) && !target.stale && !target.nativeAction);
-        target = At(timeline, localStarts[i] + 175);
+        target = At(timeline, localStarts[i] + 225);
         CHECK(target.tick == hostStarts[i] + 125 && Near(target.position[0], 1.25F));
     }
     Timeline timeline;
     auto left = Motion(1000); left.yaw = 3.10F;
     auto right = Motion(1100, 1, 20); right.yaw = -3.10F;
     CHECK(timeline.Push(left, 2000) && timeline.Push(right, 2100));
-    const auto mid = At(timeline, 2100);
-    CHECK(Near(std::abs(mid.yaw), 3.14159265F) && Near(mid.velocity[0], 15));
-    CHECK(At(timeline, 2150).tick == 1100);
-    CHECK(Near(At(timeline, 2150).position[0], 1));
+    const auto mid = At(timeline, 2150);
+    // Velocity is the rendered segment's derivative, not the sample average.
+    CHECK(Near(std::abs(mid.yaw), 3.14159265F) && Near(mid.velocity[0], 10));
+    CHECK(At(timeline, 2200).tick == 1100);
+    CHECK(Near(At(timeline, 2200).position[0], 1));
     // Reverse wrap takes the equally short route.
     timeline.Reset(); left.yaw = -3.10F; right.yaw = 3.10F;
     CHECK(timeline.Push(left, 2000) && timeline.Push(right, 2100));
-    CHECK(Near(std::abs(At(timeline, 2100).yaw), 3.14159265F));
+    CHECK(Near(std::abs(At(timeline, 2150).yaw), 3.14159265F));
 }
 void JitterAndDuplicates() {
     Timeline timeline;
     CHECK(timeline.Push(Motion(1000, 0), 2000)); // Offset +1000.
     CHECK(timeline.Push(Motion(1100, 1), 2130)); // +1030 must not replace minimum.
-    CHECK(Near(At(timeline, 2130).position[0], .8F));
+    CHECK(Near(At(timeline, 2130).position[0], .3F));
     CHECK(timeline.Push(Motion(1200, 2), 2190)); // New minimum +990.
-    CHECK(Near(At(timeline, 2190).position[0], 1.5F));
+    CHECK(Near(At(timeline, 2190).position[0], 1.0F));
     const auto count = timeline.Count();
     CHECK(!timeline.Push(Motion(1199, 900), 2200));
     CHECK(!timeline.Push(Motion(1200, 900), 2200));
@@ -113,7 +115,7 @@ void JitterAndDuplicates() {
     CHECK(!At(timeline, 2789).stale && At(timeline, 2790).stale);
     // Duplicate with a smaller offset must not move the clock estimate either.
     CHECK(timeline.Push(Motion(1200, 2), 1200));
-    CHECK(Near(At(timeline, 2190).position[0], 1.5F));
+    CHECK(Near(At(timeline, 2190).position[0], 1.0F));
     CHECK(!timeline.Push(Motion(1000), 4000));
     // A newly delivered but already old sample cannot revive old motion.
     CHECK(timeline.Push(Motion(1201, 2), 4000));
@@ -122,9 +124,9 @@ void JitterAndDuplicates() {
 void ExtrapolationAndStale() {
     Timeline timeline;
     CHECK(timeline.Push(Motion(1000, 10, 20), 2000));
-    CHECK(Near(At(timeline, 2075).position[0], 10.5F));
-    const auto cap = At(timeline, 2125);
-    CHECK(cap.tick == 1075 && Near(cap.position[0], 11.5F) && cap.velocity[0] == 0);
+    CHECK(Near(At(timeline, 2125).position[0], 10.5F));
+    const auto cap = At(timeline, 2250); // 150 ms extrapolation bound.
+    CHECK(cap.tick == 1150 && Near(cap.position[0], 13.0F) && cap.velocity[0] == 0);
     const auto held = At(timeline, 2599);
     CHECK(!held.stale && held.tick == cap.tick && held.position == cap.position && held.velocity[0] == 0);
     for (const std::uint64_t now : {2600ULL, 3000ULL, 900000ULL}) {
@@ -137,13 +139,71 @@ void ExtrapolationAndStale() {
     // Saturated host conversion and timestamp addition never wrap backwards.
     timeline.Reset();
     const auto limit = (std::numeric_limits<std::uint64_t>::max)();
-    CHECK(timeline.Push(Motion(limit - 100, 1), 0));
-    const auto nearLimit = At(timeline, 200);
-    CHECK(nearLimit.tick == limit - 50 && Near(nearLimit.position[0], 1.5F));
+    CHECK(timeline.Push(Motion(limit - 200, 1), 0));
+    const auto nearLimit = At(timeline, 250);
+    CHECK(nearLimit.tick == limit - 100 && Near(nearLimit.position[0], 2.0F));
     CHECK(At(timeline, 600).stale);
 }
+void NativeActionPath() {
+    // Native actions (vent entry/exit, passages) are a continuous path: they
+    // keep the 100 ms delay and interpolate instead of chasing the raw sample.
+    Timeline timeline;
+    CHECK(timeline.Push(Motion(1000, 0), 2000));
+    CHECK(timeline.Push(Motion(1100, 1), 2100));
+    auto action = Motion(1200, 2); action.flags |= NativeAction;
+    CHECK(timeline.Push(action, 2200) && timeline.Count() == 3);
+    auto target = At(timeline, 2200); // Render tick 1100: still ordinary.
+    CHECK(Near(target.position[0], 1) && !target.nativeAction);
+    target = At(timeline, 2250); // 1150: segment into the action.
+    CHECK(Near(target.position[0], 1.5F) && Near(target.velocity[0], 10) && target.nativeAction);
+    action.tick = 1300; action.position[0] = 3;
+    CHECK(timeline.Push(action, 2300) && timeline.Count() == 4);
+    target = At(timeline, 2350); // 1250: between two action samples.
+    CHECK(Near(target.position[0], 2.5F) && target.nativeAction && !target.stale);
+    // Leaving the action keeps the same delay: no backward jump on exit.
+    CHECK(timeline.Push(Motion(1400, 4), 2400) && timeline.Count() == 5);
+    target = At(timeline, 2400); // 1300.
+    CHECK(Near(target.position[0], 3) && target.nativeAction);
+    target = At(timeline, 2460); // 1360: action -> ordinary segment.
+    CHECK(Near(target.position[0], 3.6F) && target.nativeAction);
+    CHECK(timeline.Push(Motion(1500, 5), 2500));
+    target = At(timeline, 2550); // 1450: ordinary again.
+    CHECK(Near(target.position[0], 4.5F) && !target.nativeAction);
+}
+void RenderDelay() {
+    // Explicit delay: action follow renders near the newest sample.
+    Timeline timeline;
+    CHECK(timeline.Push(Motion(1000, 0), 2000));
+    CHECK(timeline.Push(Motion(1100, 1), 2100));
+    Target target{};
+    CHECK(timeline.SampleAt(2100, target, kActionInterpolationDelayMs));
+    CHECK(target.tick == 1070 && Near(target.position[0], .7F));
+    CHECK(timeline.SampleAt(2100, target, 0) && target.tick == 1100 && Near(target.position[0], 1));
+    CHECK(timeline.SampleAt(2100, target, 100000) && target.tick == 1000); // Clamped to 500 ms.
+    // Ramp: 0.5 ms per ms toward the target, both directions, never overshoot.
+    CHECK(Near(StepRenderDelay(100, 30, 20), 90));
+    CHECK(Near(StepRenderDelay(35, 30, 20), 30));
+    CHECK(Near(StepRenderDelay(30, 100, 40), 50));
+    CHECK(Near(StepRenderDelay(100, 100, 16), 100));
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    CHECK(Near(StepRenderDelay(nan, 30, 16), 30));
+    CHECK(Near(StepRenderDelay(50, 30, -1), 30));
+    CHECK(Near(StepRenderDelay(50, nan, 1000), 100));
+    CHECK(Near(StepRenderDelay(50, 5000, 100000), 500));
+    // A ramp keeps the rendered Host clock monotonic: 16 ms frames while the
+    // delay shrinks 100 -> 30 advance the render tick 16..24 ms per frame.
+    float delay = 100;
+    std::uint64_t previous = 0;
+    for (std::uint64_t now = 2000; now <= 2400; now += 16) {
+        delay = StepRenderDelay(delay, 30, 16);
+        const auto render = now - 1000 - static_cast<std::uint64_t>(delay);
+        CHECK(previous == 0 || (render > previous && render - previous <= 24));
+        previous = render;
+    }
+    CHECK(Near(delay, 30));
+}
 void Barriers() {
-    for (const auto flag : {NativeAction, Discontinuity, NativeAction | Discontinuity}) {
+    for (const auto flag : {Discontinuity, NativeAction | Discontinuity}) {
         Timeline timeline;
         CHECK(timeline.Push(Motion(1000, 0), 2000));
         CHECK(timeline.Push(Motion(1100, 1), 2100));
@@ -159,7 +219,7 @@ void Barriers() {
         CHECK(timeline.Push(Motion(1300, -900000), 2300) && timeline.Count() == 1);
         CHECK(At(timeline, 2300).position[0] == -900000 && !At(timeline, 2300).nativeAction);
         CHECK(timeline.Push(Motion(1400, -899999), 2400) && timeline.Count() == 2);
-        CHECK(Near(At(timeline, 2400).position[0], -899999.5F));
+        CHECK(Near(At(timeline, 2450).position[0], -899999.5F));
         // Repeated action samples must never become an interpolation segment.
         barrier.tick = 1500;
         CHECK(timeline.Push(barrier, 2500));
@@ -197,7 +257,7 @@ void ValidationAndCapacity() {
     auto edge = Motion(1, 1000000, 128);
     edge.position[1] = -1000000; edge.velocity[1] = -128; edge.yaw = 3.3F;
     CHECK(timeline.Push(edge, 1000));
-    const auto clamped = At(timeline, 1100);
+    const auto clamped = At(timeline, 1200);
     CHECK(clamped.position[0] == 1000000 && clamped.position[1] == -1000000 &&
         clamped.velocity[0] == 0 && clamped.velocity[1] == 0);
     timeline.Reset(); edge.yaw = -3.3F;
@@ -207,7 +267,7 @@ void ValidationAndCapacity() {
         CHECK(timeline.Push(Motion(i * 10, static_cast<float>(i)), i * 10 + 1000));
         CHECK(timeline.Count() == (i < kHistoryCapacity ? i : kHistoryCapacity));
     }
-    CHECK(Near(At(timeline, 11000).position[0], 995)); // Ring wraps retain order.
+    CHECK(Near(At(timeline, 11000).position[0], 990)); // Ring wraps retain order.
     CHECK(!timeline.Push(Motion(100), 11000));
     CHECK(At(timeline, 0).position[0] == 873); // Before oldest retained sample holds.
 }
@@ -219,6 +279,8 @@ int main() {
     ClocksAndInterpolation();
     JitterAndDuplicates();
     ExtrapolationAndStale();
+    NativeActionPath();
+    RenderDelay();
     Barriers();
     ValidationAndCapacity();
     std::cout << "AISyncHybridMotionTests passed\n";

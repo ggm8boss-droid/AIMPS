@@ -251,6 +251,12 @@ struct Actor {
     // the Character does not leave this point (514: 4-5 s frozen walks).
     float directPoseAnchor[3]{};
     ULONGLONG directPoseAnchorAt{}, directPoseLastStuckCorrection{}, directPoseAssistAt{};
+    // Render delay shared by every consumer of directPoseTimeline: 100 ms for
+    // ordinary locomotion, ~30 ms while a Host native action is followed, and
+    // ramped between them so the rendered Host clock never jumps.
+    float directPoseDelayMs{static_cast<float>(hybrid_motion::kInterpolationDelayMs)};
+    ULONGLONG directPoseDelayAt{}, directPoseActionAt{};
+    bool directPoseActionFollowing{};
     movement::ProgressClock recoveryProgress{};
     movement::ObservedTrail observedTrail{};
     ULONGLONG recoveryPoseAt{},recoveryLastTick{},recoveryLastHardSnap{};
@@ -887,6 +893,33 @@ std::atomic<std::uint64_t> gReservedByOutcome{},gReservedByPair{};
 std::atomic<std::uint64_t> gCycleCallsCaptured{},gCycleCallsRefused{},gCycleCallsPublished{},gCycleCallsReplayed{},gCycleCallsReplayFailed{};
 std::atomic<std::uint64_t> gDirectLocomotionConstructorsConsumed{};
 std::atomic<std::uint64_t> gDirectPoseStuckCorrections{},gDirectPoseEmergencyCorrections{},gDirectPoseAssistFrames{},gDirectPoseActionFollowFrames{};
+// Action follow (vent entry/exit, passages, other Host-owned native actions).
+std::atomic<std::uint64_t> gDirectPoseActionTrackFrames{},gDirectPoseActionCatchUpFrames{},gDirectPoseActionRefused{};
+std::atomic<std::uint32_t> gDirectPoseActionMaxErrorMm{},gDirectPoseActionMaxVerticalErrorMm{},gDirectPoseLastDelayMs{};
+void StoreMax(std::atomic<std::uint32_t>& slot,const float meters) noexcept {
+    if(!std::isfinite(meters)||meters<=0.0F)return;
+    const auto value=static_cast<std::uint32_t>(std::min(meters*1000.0F,4.0e9F));
+    auto current=slot.load(std::memory_order_relaxed);
+    while(value>current&&!slot.compare_exchange_weak(current,value,std::memory_order_relaxed)){}
+}
+void ResetDirectPoseClock(Actor& actor) noexcept {
+    actor.directPoseDelayMs=static_cast<float>(hybrid_motion::kInterpolationDelayMs);
+    actor.directPoseDelayAt=actor.directPoseActionAt=0U;
+    actor.directPoseActionFollowing=false;
+}
+// Every consumer samples through here, so the pre-pass follower, the action
+// follower and the POST reconcile see one continuous rendered Host clock.
+bool SampleDirectPose(Actor& actor,hybrid_motion::Target& target) noexcept {
+    const auto now=PreciseTickMs();
+    const float elapsed=actor.directPoseDelayAt&&now>actor.directPoseDelayAt
+        ? static_cast<float>(now-actor.directPoseDelayAt) : 0.0F;
+    actor.directPoseDelayAt=now;
+    const auto wanted=actor.directPoseActionFollowing
+        ? hybrid_motion::kActionInterpolationDelayMs : hybrid_motion::kInterpolationDelayMs;
+    actor.directPoseDelayMs=hybrid_motion::StepRenderDelay(actor.directPoseDelayMs,static_cast<float>(wanted),elapsed);
+    gDirectPoseLastDelayMs.store(static_cast<std::uint32_t>(actor.directPoseDelayMs),std::memory_order_relaxed);
+    return actor.directPoseTimeline.SampleAt(now,target,static_cast<std::uint64_t>(actor.directPoseDelayMs+0.5F));
+}
 std::atomic<std::uint32_t> gLastRefusedCycleCall{};
 std::atomic<std::uint64_t> gIntakeHeldByPair{},gIntakeHeldByHealth{},gIntakeHeldByParticipant{},gIntakeHeldByCombat{};
 std::atomic<std::uint64_t> gExecutionCaptured{}, gExecutionTransitions{}, gExecutionReplayed{}, gExecutionReplayRejected{};
@@ -1029,6 +1062,20 @@ bool Stable() noexcept {
 }
 bool FiniteCoordinate(const float value) noexcept {
     return std::isfinite(value) && std::abs(value) <= 100000.0F;
+}
+// The Client's own current cycle is ordinary idle/locomotion.
+bool LocalOrdinaryLocomotion(const Actor& actor) noexcept {
+    std::uintptr_t cycle{},table{};std::uint8_t cycleState{};
+    return actor.character&&Read(actor.character+0x36CU,cycle)&&cycle&&Read(cycle,table)&&table>=gBase&&
+        Read(cycle+0x1AU,cycleState)&&HybridLocomotionCycleAllowed(static_cast<std::uint32_t>(table-gBase),cycleState);
+}
+// A rendered segment that still touches a Host action sample only blocks the
+// locomotion followers while the Client itself plays a non-locomotion cycle.
+// Once the Client is back in locomotion (vent exit, end of a reaction) it
+// keeps following the Host body across that boundary instead of standing
+// still for ~80 ms and then catching up (hitch at every action exit).
+bool DirectPoseActionBlocksLocomotion(const Actor& actor,const hybrid_motion::Target& target) noexcept {
+    return target.nativeAction&&!LocalOrdinaryLocomotion(actor);
 }
 bool CertifiedExecutionCycle(std::uint32_t typeRva, std::uint32_t state) noexcept;
 bool SuppressedAlien(std::uintptr_t character) noexcept;
@@ -5197,7 +5244,7 @@ bool Release(Actor& actor) noexcept {
     actor.rejectedNavigationRevision = actor.rejectedNavigationRequestRevision = 0U;
     actor.lastNavigationAttempt = 0U;
     actor.poseCount = 0U; actor.poseRevision = 0U; actor.poseInterpolating = false;
-    actor.directPoseTimeline.Reset(); actor.directPoseBirth = 0U;
+    actor.directPoseTimeline.Reset(); actor.directPoseBirth = 0U; ResetDirectPoseClock(actor);
     actor.directPoseDivergenceSince=actor.directPoseLastEmergencyCorrection=0U;
     ReleaseNativeFollow(actor);
     actor.recoveryFollowing = actor.recoveryNativeArmed = false;
@@ -10028,7 +10075,7 @@ void BeginExecutionCarrierScope(const transactions::Scope& scope) noexcept {
         actor.received={};actor.streamRevision=actor.streamBirth=actor.streamCycleState=actor.streamPairRevision=actor.streamCycleType=0U;
         actor.desired={};actor.pendingRemoteShots.clear();actor.initialPlacementReady=false;actor.lastSpawnDiagnostic=0;
         actor.recoveryPose={};actor.recoveryPoseAt=actor.recoveryLastTick=actor.recoveryLastHardSnap=0;
-        actor.directPoseTimeline.Reset();actor.directPoseBirth=0U;
+        actor.directPoseTimeline.Reset();actor.directPoseBirth=0U;ResetDirectPoseClock(actor);
         actor.directPoseDivergenceSince=actor.directPoseLastEmergencyCorrection=0U;
         actor.observedTrail.Clear();
         actor.recoveryProgress={};
@@ -10082,7 +10129,7 @@ bool ApplyExecutionCarrier(const State& state,std::uint64_t through,std::uint64_
         // timestamp. Keep only the current incarnation; old segments must
         // never interpolate across a death, respawn or world transition.
         if(actor->directPoseBirth!=state.birth) {
-            actor->directPoseTimeline.Reset();
+            actor->directPoseTimeline.Reset();ResetDirectPoseClock(*actor);
             actor->directPoseBirth=state.birth;
         }
         if((state.motionFlags&hybrid_motion::Valid)!=0U) {
@@ -10764,8 +10811,8 @@ void PumpOnEngineThread() noexcept {
             relinquish();continue;
         }
         hybrid_motion::Target target{};
-        if(!actor.directPoseTimeline.SampleAt(PreciseTickMs(),target) || target.stale ||
-            target.nativeAction || target.discontinuity) {
+        if(!SampleDirectPose(actor,target) || target.stale ||
+            DirectPoseActionBlocksLocomotion(actor,target) || target.discontinuity) {
             relinquish();continue;
         }
         const auto& state=actor.recoveryPose;
@@ -10814,16 +10861,45 @@ void PumpOnEngineThread() noexcept {
 // 3.5 m emergency snapped it 15.8/31.7 m right onto the player before a kill).
 // Carry the Client body along the Host pose for these non-paired actions.
 // Paired kills keep native alignment and are never touched here.
+//
+// 537 (vent entry sinking / non-smooth action follow). AI.exe facts (Hex-Rays):
+// - TeleportCharacter (007ECCA0) rewrites Character+70/+B0/+C0, zeroes
+//   +184/+1D0/+266, writes +170=Y and sets registry entry+AA.
+// - The per-frame controller input (007F6890) integrates root motion
+//   (+B0, vertical only if +262) and gravity (only if +263; x4 when +266==0)
+//   ONLY while entry+AA is clear, then clears it. So a frame that follows a
+//   teleport has no root motion and no gravity: per-frame teleports make the
+//   body kinematic.
+// - The scripted-cycle init (0066C4C0) sets +267 (registry mode 5: keyframed,
+//   layer 18) and clears +263 (gravity) unless clip nativeFlags (cycle+98)
+//   bit 8 is set; bit 0x10 controls +268; +2A6 is always set. 00656990
+//   restores them. Gravity therefore stays ON for clips with bit 8.
+// The old follower skipped the teleport inside a 3 cm dead zone, so on those
+// frames native physics ran with whatever the clip left (gravity, x4 because
+// the previous teleport zeroed +266), then the next teleport lifted the body
+// again; per-FRAME caps (0.15/0.35 m) also made it frame-rate dependent. The
+// 536 NPC capture (body drops ~0.5 m mid vent clip without Host authority)
+// fits that, but the in-game vent sink is NOT yet proven to be this alone:
+// check directPoseActionMaxVerticalErrorMm in the next two-player test.
+// - The action target was also the raw latest 20 Hz sample (timeline barrier),
+//   a staircase in both position and height.
+// Now: the timeline interpolates through actions (~30 ms behind the newest
+// sample, in phase with the Client's natively started clip); scripted vent
+// clips and passages are tracked EVERY frame (no free physics frame), with a
+// per-second catch-up rate beyond the tracking radius instead of per-frame
+// caps (frame-rate independent). Generic actions keep native root motion
+// inside their dead zone as before.
 bool FollowHostActionPose(Actor& actor) noexcept {
+    actor.directPoseActionFollowing=false;
     if(!actor.character||actor.duplicate||actor.faulted||!actor.initialPlacementReady||
         !actor.remoteBirth||actor.directPoseBirth!=actor.remoteBirth||
         PvPCharacterFenced(actor.character)||PairReservedCharacter(actor.character)||
         PairSourceBusy(actor.character)||
         (actor.desired.executionFlags&ExecutionPaired)!=0U||
         (actor.received.executionFlags&ExecutionPaired)!=0U||
-        health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health))return false;
+        health::Terminal(actor.desired.health)||health::Terminal(actor.recoveryPose.health)){actor.directPoseActionAt=0U;return false;}
     std::uintptr_t cycle{};std::uint8_t cycleState{};
-    if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,cycleState))return false;
+    if(!Read(actor.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,cycleState)){actor.directPoseActionAt=0U;return false;}
     const bool scripted=cycleState==0x12U;
     const bool passage=cycleState==0x4BU||cycleState==0x4CU||cycleState==0x4DU;
     // Any other Host-ordered native action (e.g. state 0x57) plays its own
@@ -10832,7 +10908,8 @@ bool FollowHostActionPose(Actor& actor) noexcept {
     // stays with the direct motor; paired states are excluded above.
     const bool locomotion=cycleState==1U||cycleState==0x37U||cycleState==0x38U||cycleState==0x3BU;
     const bool action=!scripted&&!passage&&!locomotion&&cycleState!=0x4EU&&cycleState!=0x4FU;
-    if(!scripted&&!passage&&!action)return false;
+    if(!scripted&&!passage&&!action){actor.directPoseActionAt=0U;return false;}
+    actor.directPoseActionFollowing=true;
     std::uint32_t liveRuntime{},liveEntityA{},liveEntityB{};
     if(!Read(actor.character+0x50U,liveRuntime)||liveRuntime!=actor.runtimeId||
         !Read(actor.character+0x54U,liveEntityA)||liveEntityA!=actor.entityA||
@@ -10841,22 +10918,42 @@ bool FollowHostActionPose(Actor& actor) noexcept {
     if(state.birth!=actor.remoteBirth||state.sessionCookie!=gCurrent.sessionCookie||
         state.worldGeneration!=gCurrent.worldGeneration||(state.stateFlags&PoseValid)==0U)return true;
     hybrid_motion::Target target{};
-    if(!actor.directPoseTimeline.SampleAt(PreciseTickMs(),target)||target.stale)return true;
+    if(!SampleDirectPose(actor,target)||target.stale){actor.directPoseActionAt=0U;return true;}
     float local[3]{};
     if(!Read(actor.character+kPositionOffset,local[0])||!Read(actor.character+kPositionOffset+4U,local[1])||
         !Read(actor.character+kPositionOffset+8U,local[2]))return true;
+    const auto now=PreciseTickMs();
+    // First frame of a follow: assume one 60 Hz frame, never a long gap.
+    const float frameSeconds=actor.directPoseActionAt&&now>actor.directPoseActionAt
+        ? std::min(static_cast<float>(now-actor.directPoseActionAt)/1000.0F,0.05F) : 1.0F/60.0F;
+    actor.directPoseActionAt=now;
     const float dx=target.position[0]-local[0],dy=target.position[1]-local[1],dz=target.position[2]-local[2];
     const float distance=std::sqrt(dx*dx+dy*dy+dz*dz);
+    if(!std::isfinite(distance))return true;
+    StoreMax(gDirectPoseActionMaxErrorMm,distance);
+    StoreMax(gDirectPoseActionMaxVerticalErrorMm,std::abs(dy));
     // Generic actions keep their native root motion inside 0.25 m.
-    if(!std::isfinite(distance)||distance<(action?0.25F:0.03F))return true;
-    // Never jump the physics body over several metres in a single frame,
-    // even inside a vent. A delayed passage must approach at bounded steps;
-    // the old uncapped jump could materialize the Alien on a living survivor.
-    const float cap=passage?0.35F:(action?0.10F:0.15F);
-    const float scale=std::min(1.0F,cap/distance);
+    if(action&&distance<0.25F)return true;
+    const float hostSpeed=std::sqrt(target.velocity[0]*target.velocity[0]+
+        target.velocity[1]*target.velocity[1]+target.velocity[2]*target.velocity[2]);
+    // Tracking radius: inside it the (already smoothed) target is applied
+    // exactly. Beyond it, approach at Host speed + catch-up, bounded by an
+    // absolute speed so a delayed passage never materializes the Alien on a
+    // living survivor (the old uncapped jump did). Speed bounds equal the old
+    // per-frame caps at 60 Hz: 9 m/s clip, 21 m/s passage, 6 m/s action.
+    const float track=action?0.0F:(passage?1.0F:0.50F);
+    const float catchUp=passage?6.0F:(action?1.5F:3.0F);
+    const float maximumSpeed=passage?21.0F:(action?6.0F:9.0F);
+    float scale=1.0F;
+    if(distance>track) {
+        const float step=std::min((hostSpeed+catchUp)*frameSeconds,maximumSpeed*frameSeconds);
+        scale=distance>0.0F?std::min(1.0F,step/distance):1.0F;
+        gDirectPoseActionCatchUpFrames.fetch_add(1U,std::memory_order_relaxed);
+    } else gDirectPoseActionTrackFrames.fetch_add(1U,std::memory_order_relaxed);
     const float pose[3]{local[0]+dx*scale,local[1]+dy*scale,local[2]+dz*scale};
     if(character_direct_step_runtime::ApplyAIRecoveryTransform(actor.character,pose,target.yaw))
         gDirectPoseActionFollowFrames.fetch_add(1U,std::memory_order_relaxed);
+    else gDirectPoseActionRefused.fetch_add(1U,std::memory_order_relaxed);
     return true;
 }
 void ReconcileDirectPoseOnEngineThread() noexcept {
@@ -10887,8 +10984,8 @@ void ReconcileDirectPoseOnEngineThread() noexcept {
             actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
         }
         hybrid_motion::Target target{};
-        if(!actor.directPoseTimeline.SampleAt(PreciseTickMs(),target)||target.stale||
-            target.nativeAction||target.discontinuity) {
+        if(!SampleDirectPose(actor,target)||target.stale||
+            DirectPoseActionBlocksLocomotion(actor,target)||target.discontinuity) {
             actor.directPoseDivergenceSince=0U;actor.directPoseAnchorAt=actor.directPoseAssistAt=0U;continue;
         }
         const auto& state=actor.recoveryPose;
@@ -12196,6 +12293,12 @@ void LogDiagnostics(Diagnostics& diagnostics) {
          {"directLocomotionConstructorsConsumed", Diagnostics::Unsigned(gDirectLocomotionConstructorsConsumed.load()), true},
          {"directPoseAssistFrames", Diagnostics::Unsigned(gDirectPoseAssistFrames.load()), true},
          {"directPoseActionFollowFrames", Diagnostics::Unsigned(gDirectPoseActionFollowFrames.load()), true},
+         {"directPoseActionTrackFrames", Diagnostics::Unsigned(gDirectPoseActionTrackFrames.load()), true},
+         {"directPoseActionCatchUpFrames", Diagnostics::Unsigned(gDirectPoseActionCatchUpFrames.load()), true},
+         {"directPoseActionRefused", Diagnostics::Unsigned(gDirectPoseActionRefused.load()), true},
+         {"directPoseActionMaxErrorMm", Diagnostics::Unsigned(gDirectPoseActionMaxErrorMm.load()), true},
+         {"directPoseActionMaxVerticalErrorMm", Diagnostics::Unsigned(gDirectPoseActionMaxVerticalErrorMm.load()), true},
+         {"directPoseRenderDelayMs", Diagnostics::Unsigned(gDirectPoseLastDelayMs.load()), true},
          {"nativeFollowCreated", Diagnostics::Unsigned(gFollowCreated.load()), true},
          {"nativeFollowCreateFailures", Diagnostics::Unsigned(gFollowCreateFailures.load()), true},
          {"nativeFollowCompleted", Diagnostics::Unsigned(gFollowCompleted.load()), true},

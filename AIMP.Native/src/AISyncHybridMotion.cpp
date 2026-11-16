@@ -62,7 +62,7 @@ Target Pose(const Sample& sample) noexcept {
     target.position = sample.position;
     // Retain ordinary linear velocity even before a second sample arrives.
     // A zero-velocity first frame otherwise forces retail Move -> Idle -> Move.
-    if ((sample.flags & kBoundary) == 0U) target.velocity = sample.velocity;
+    if ((sample.flags & Discontinuity) == 0U) target.velocity = sample.velocity;
     target.yaw = sample.yaw;
     target.tick = sample.tick;
     target.nativeAction = (sample.flags & NativeAction) != 0;
@@ -90,9 +90,15 @@ bool Timeline::Push(const Sample& sample, std::uint64_t arrivalMs) noexcept {
         offsetMagnitude_ = magnitude;
     }
 
+    // Only a real spatial Discontinuity (teleport, backstage/frontstage) cuts
+    // the history. NativeAction samples (vent entry/exit, passages, reactions)
+    // are a continuous physical path and stay interpolated with the same
+    // 100 ms delay. Treating them as barriers made the Client chase the raw
+    // latest 20 Hz sample (a staircase) and switched the render delay
+    // 100 ms -> 0 -> 100 ms at every action entry/exit (forward/backward snap).
     if (count_ != 0) {
         const auto& latest = history_[(first_ + count_ - 1) % kHistoryCapacity];
-        if (((sample.flags | latest.flags) & kBoundary) != 0) {
+        if (((sample.flags | latest.flags) & Discontinuity) != 0) {
             first_ = 0;
             count_ = 0;
         }
@@ -107,8 +113,24 @@ bool Timeline::Push(const Sample& sample, std::uint64_t arrivalMs) noexcept {
     return true;
 }
 
+float StepRenderDelay(float currentMs, float targetMs, float elapsedMs) noexcept {
+    const float limit = static_cast<float>(kMaxInterpolationDelayMs);
+    if (!std::isfinite(targetMs)) targetMs = static_cast<float>(kInterpolationDelayMs);
+    targetMs = std::clamp(targetMs, 0.0F, limit);
+    if (!std::isfinite(currentMs) || !std::isfinite(elapsedMs) || elapsedMs < 0.0F) return targetMs;
+    currentMs = std::clamp(currentMs, 0.0F, limit);
+    const float step = (std::min)(elapsedMs, 1000.0F) * kRenderDelayRampPerMs;
+    if (currentMs < targetMs) return (std::min)(targetMs, currentMs + step);
+    return (std::max)(targetMs, currentMs - step);
+}
+
 bool Timeline::SampleAt(std::uint64_t now, Target& out) const noexcept {
+    return SampleAt(now, out, kInterpolationDelayMs);
+}
+
+bool Timeline::SampleAt(std::uint64_t now, Target& out, std::uint64_t delayMs) const noexcept {
     if (count_ == 0) return false;
+    delayMs = (std::min)(delayMs, kMaxInterpolationDelayMs);
     const auto& latest = history_[(first_ + count_ - 1) % kHistoryCapacity];
     const auto hostNow = offsetNegative_ ? AddSaturated(now, offsetMagnitude_) :
         (now >= offsetMagnitude_ ? now - offsetMagnitude_ : 0);
@@ -120,12 +142,12 @@ bool Timeline::SampleAt(std::uint64_t now, Target& out) const noexcept {
         out.stale = true;
         return true;
     }
-    if ((latest.flags & kBoundary) != 0) {
+    if ((latest.flags & Discontinuity) != 0) {
         out = Pose(latest);
         return true;
     }
 
-    const auto renderTick = hostNow >= kInterpolationDelayMs ? hostNow - kInterpolationDelayMs : 0;
+    const auto renderTick = hostNow >= delayMs ? hostNow - delayMs : 0;
     const auto& earliest = history_[first_];
     if (renderTick <= earliest.tick) {
         out = Pose(earliest);
@@ -147,6 +169,9 @@ bool Timeline::SampleAt(std::uint64_t now, Target& out) const noexcept {
             target.velocity[axis] = segment[axis];
         }
         target.yaw = Wrap(left.yaw + Wrap(right.yaw - left.yaw) * fraction);
+        // A segment that touches a native action is owned by that action:
+        // the ordinary locomotion follower must stand down for it.
+        target.nativeAction = ((left.flags | right.flags) & NativeAction) != 0;
         out = target;
         return true;
     }

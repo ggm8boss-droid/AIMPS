@@ -127,3 +127,30 @@ Changes:
   - The Client only ever received causal packet 1, so its Alien stayed at spawn.
 - **Fix.** The execution sender and the shadow send/ready bounds are raised from 2 s to 10 s, matching `PeerTimeout`.
 - The 522 kinematic tracking could not be evaluated in this run.
+
+## 537 – Smooth Host-action follow (vent entry/exit, passages)
+
+No new diagnostics archive was available; this change comes from code review plus AI.exe reverse engineering (IDA/Hex-Rays on the retail executable).
+
+**Retail facts (verified in the decompiled code):**
+- `TeleportCharacter` (007ECCA0) rewrites Character+70/+B0/+C0, zeroes +184/+1D0/+266, writes +170 = Y and sets registry entry+AA.
+- The per-frame controller input (007F6890) integrates root motion (+B0; vertical only if +262) and gravity (only if +263; ×4 when +266 == 0) **only while entry+AA is clear**, then clears it. A frame right after a teleport has no root motion and no gravity.
+- The scripted-cycle init (0066C4C0) sets +267 (registry mode 5: keyframed body, collision layer 18) and clears +263 (gravity) unless clip nativeFlags (cycle+98) bit 8 is set. Bit 0x10 controls +268, and +2A6 is always set. The scripted destructor (00656990) restores them.
+
+**Client defects found:**
+1. **The timeline treated NativeAction samples as barriers.** Every action sample wiped the history, so during vent clips and passages the client chased the *raw latest 20 Hz sample*: position and height moved in steps. The render delay also jumped 100 ms → 0 → 100 ms at every action entry/exit, a forward snap on entry and a backward snap on exit.
+2. **`FollowHostActionPose` used per-frame caps with a dead zone.** Steps were capped at 0.15/0.35/0.10 m per *frame*, so the follow depended on frame rate. Inside a 3 cm dead zone it did not teleport, and native physics then ran a free frame: gravity (×4, because the previous teleport zeroed +266) for clips that keep gravity, plus collision. The next teleport lifted the body again. This alternation is the leading candidate for the "partially sinks into the floor" report. It is not proven in game yet.
+3. **Both locomotion followers stood down across an action→locomotion boundary.** While the rendered segment still touched the Host's last action sample (~80 ms), nothing drove the body, which caused a hitch at every vent exit or reaction end.
+
+**Changes:**
+- **Timeline.** Only `Discontinuity` cuts the history. Action samples interpolate like ordinary ones, and a segment touching an action sample reports `nativeAction`. A new `SampleAt(now, out, delayMs)` takes an explicit delay, and `StepRenderDelay` ramps it.
+- **One render clock per actor (`SampleDirectPose`).** The delay is 100 ms for locomotion and 30 ms while a Host action is followed. The 30 ms keeps the target in phase with the Client's natively started clip, whose command arrives with the newest sample. The delay ramps at 0.5 ms/ms, so the rendered Host clock runs at 0.5–1.5× and never jumps.
+- **`FollowHostActionPose`.** Scripted clips (0x12) and passages (0x4B–0x4D) are applied **every frame**: exactly within 0.5 m (clip) or 1.0 m (passage), and beyond that at Host speed + 3 m/s (clip) or + 6 m/s (passage). Absolute speed bounds equal the old caps at 60 Hz (9/21 m/s), so the follow is frame-rate independent and native physics never runs a free frame. Generic actions keep native root motion inside 0.25 m, then approach at Host speed + 1.5 m/s (≤ 6 m/s).
+- **Locomotion followers** are blocked by `nativeAction` only while the Client's own cycle is not ordinary locomotion (`DirectPoseActionBlocksLocomotion`).
+- **New counters:** `directPoseActionTrackFrames`, `directPoseActionCatchUpFrames`, `directPoseActionRefused`, `directPoseActionMaxErrorMm`, `directPoseActionMaxVerticalErrorMm`, `directPoseRenderDelayMs`.
+- **Tests.** `tests/AISyncHybridMotionTests.cpp` was out of date since 510 (50 ms delay / 75 ms extrapolation, plus a `Target` initializer that no longer set `stale`). It has been updated to the 100/150 ms contract, with new `NativeActionPath` and `RenderDelay` cases. Passes with MSVC x86.
+
+**In-game check (two players, one Alien):**
+1. Watch the Alien enter and leave several vents on the Client. The body should no longer step, sink, or snap forward/back at clip start and end.
+2. Compare `directPoseActionMaxVerticalErrorMm` and `directPoseActionMaxErrorMm` in the Client diagnostics. A large vertical error with few `directPoseActionRefused` points at the Host target itself (Host Character+70 vs. the rendered body). Many refusals mean the teleport is being refused.
+3. Check that locomotion after a vent exit continues without a stop.
