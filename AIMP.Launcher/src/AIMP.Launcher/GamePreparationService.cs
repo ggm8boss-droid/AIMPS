@@ -66,8 +66,9 @@ public sealed class GamePreparationService
             _jobCancel?.Dispose();
             _jobCancel = CancellationTokenSource.CreateLinkedTokenSource(_shutdown);
             var token = _jobCancel.Token;
-            var includeCampaign = settings.DeveloperMode;
-            _job = Task.Run(() => Run(game.GameDirectory, includeCampaign, id, token), CancellationToken.None);
+            // As on main: campaign levels are always prepared, so Campaign lobbies
+            // work without Developer mode.
+            _job = Task.Run(() => Run(game.GameDirectory, includeCampaign: true, id, token), CancellationToken.None);
             return _status;
         }
     }
@@ -185,12 +186,9 @@ public sealed class GamePreparationService
                     throw new InvalidOperationException("Prepare this installation in the Launcher before starting a multiplayer game.");
                 receipt = _receipt;
             }
-            // Campaign levels are prepared only in Developer mode (see Run).
-            if (allowCampaign && !settings.DeveloperMode)
-                throw new InvalidOperationException(MultiplayerSessionCoordinator.CampaignDisabledMessage);
-            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level, settings.DeveloperMode);
+            var source = WorldManifestAutoResolver.ResolveLevelSource(game, level, settings.DeveloperMode || allowCampaign);
             var entry = receipt.Manifests.SingleOrDefault(m => SameDirectory(source, m.LevelDirectory));
-            if (entry == null && settings.DeveloperMode)
+            if (entry == null && (settings.DeveloperMode || allowCampaign))
                 return LoadDeveloperManifest(source, cancellationToken);
             if (entry == null)
                 throw new InvalidOperationException("This level has no prepared world manifest. Close the game and prepare this map individually in Debug > WorldManifest, then relaunch.");
@@ -231,8 +229,7 @@ public sealed class GamePreparationService
         return prepared;
     }
 
-    // Survival levels (DLC) are always prepared. Campaign levels are prepared only
-    // in Developer mode, the only mode that can host a campaign lobby.
+    // Survival (DLC) and campaign levels are prepared together (main behavior).
     private void Run(string game, bool includeCampaign, string jobId, CancellationToken token)
     {
         try

@@ -16,11 +16,12 @@ internal sealed partial class MultiplayerSessionCoordinator
     {
         var level = ResolveLevel(message);
         var mode = ReadLobbyMode(message);
-        // Campaign is a Developer mode game mode (its levels are only prepared there).
+        // Campaign is available to everyone (as on main); only launching an
+        // individual campaign level needs Developer mode.
         if (mode.Equals("campaign", StringComparison.OrdinalIgnoreCase))
         {
-            if (!settings.DeveloperMode)
-                throw new InvalidOperationException(CampaignDisabledMessage);
+            if (message.Get("campaignAction", "new") == "level" && !settings.DeveloperMode)
+                throw new InvalidOperationException("Enable Developer mode to launch an individual campaign level.");
             return;
         }
         if (!mode.Equals("survival", StringComparison.OrdinalIgnoreCase))
@@ -37,9 +38,6 @@ internal sealed partial class MultiplayerSessionCoordinator
         var mode = message.Get("mode").Trim();
         return mode.Length == 0 || mode is "undefined" or "null" ? "survival" : mode;
     }
-
-    internal const string CampaignDisabledMessage =
-        "Campaign is only available in Developer mode. Enable it, then restart the game to prepare the campaign levels.";
 
     private static string LevelGameMode(string level) =>
         level.StartsWith("Challenge", StringComparison.OrdinalIgnoreCase)

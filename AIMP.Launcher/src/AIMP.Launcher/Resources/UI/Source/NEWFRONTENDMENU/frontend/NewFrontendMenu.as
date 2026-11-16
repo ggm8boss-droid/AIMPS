@@ -334,7 +334,7 @@ package frontend
          this._voiceVolumeItem = new MenuItem("Voice volume",this.voiceVolumeChanged);
          this._developerItem = new MenuItem("Developer mode: Off",this.developerToggle);
          this._developerItem.visible = false;
-         this._developerItem.description = "Unlocks the Campaign game mode and level selection. Campaign levels are prepared after restarting the game.";
+         this._developerItem.description = "Experimental game mode and level selection. Campaign levels require game preparation after restarting the game.";
          this._voicePage.page.addItem(this._developerItem);
          this._voicePage.page.addItem(this._voiceEnabledItem);
          this._voicePage.page.addItem(this._voiceModeItem);
@@ -543,7 +543,7 @@ package frontend
          this._survivorMapIds = ["survival_auto"];
          this._survivorMapLabels = ["Auto Survivor Map"];
          this._survivorMapDescriptions = ["Uses the first available survivor map until the game playlist data is loaded"];
-         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival"],["Survival"],this.serverModeChangedHandler);
+         this._serverModeItem = new MenuItemOptionOptionStepper("Game Mode",["survival","campaign"],["Survival","Campaign"],this.serverModeChangedHandler);
          this._campaignSaveItem = new MenuItemOptionOptionStepper("Campaign save",[0],["New campaign"],this.campaignSaveChangedHandler);
          this._serverMapItem = new MenuItemOptionOptionStepper("Survivor Map",this._survivorMapIds,this._survivorMapLabels,this.serverMapChangedHandler);
          this._serverPvPItem = new MenuItemOptionOptionStepper("Match Type",["coop","pvp"],["Co-op","Alien vs Survivors"],this.serverPvPChangedHandler);
@@ -1068,24 +1068,6 @@ package frontend
       {
          this.refreshSurvivorMapOptions();
       }
-
-      // Campaign is a Developer mode game mode. Without it, Survival (Co-op or
-      // Alien vs Survivors through Match Type) is the only choice.
-      private function refreshServerModeOptions() : void
-      {
-         var campaign:Boolean = this._developerMode && this._serverModeItem.selectedItem != null && String(this._serverModeItem.selectedItem) == "campaign";
-         if(this._developerMode)
-         {
-            this._serverModeItem.setItems(["survival","campaign"],["Survival","Campaign"]);
-            this._serverModeItem.descriptions = ["Create a survival server","Start a new campaign or continue a host save"];
-         }
-         else
-         {
-            this._serverModeItem.setItems(["survival"],["Survival"]);
-            this._serverModeItem.descriptions = ["Create a survival server"];
-         }
-         this._serverModeItem.selectedIndex = campaign ? 1 : 0;
-      }
       
       private function campaignSaveChangedHandler(event:MenuItemEvent) : void
       {
@@ -1513,7 +1495,6 @@ package frontend
             if(level.toUpperCase().indexOf("CHALLENGE") != 0 && level.toUpperCase().indexOf("BSPNOSTROMO_") != 0 && level.toUpperCase().indexOf("SALVAGE") != 0)
                this._campaignLevelIds.push(level);
          }
-         this.refreshServerModeOptions();
          this.refreshCampaignSaveOptions(param1);
          this.refreshSurvivorMapOptions();
          this.mpRefreshServerConfigItems();
@@ -2586,7 +2567,7 @@ package frontend
          this._serverNameItem.enabled = false;
          this._serverPasswordItem.visible = false;
          this._serverPasswordItem.description = "Configured in the launcher settings";
-         this._serverModeItem.descriptions = ["Create a survival server"];
+         this._serverModeItem.descriptions = ["Create a survival server","Start a new campaign or continue a host save"];
          this._campaignSaveItem.description = "Start a new campaign on Medium or continue a save provided by the launcher";
          this._serverMapItem.descriptions = this._survivorMapDescriptions;
          this._serverAlienItem.descriptions = ["Normal Alien behavior","Disable the Alien to explore and test this level"];
