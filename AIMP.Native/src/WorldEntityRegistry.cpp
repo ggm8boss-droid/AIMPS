@@ -1455,6 +1455,23 @@ std::optional<std::uint32_t> WorldEntityRegistry::FindWorldEntityPrimitiveType(
     return found->second.primitiveType;
 }
 
+std::vector<WorldEntityId> WorldEntityRegistry::FindWorldEntitiesOfPrimitiveType(
+    const std::uint32_t primitiveType, const std::size_t limit) const noexcept {
+    std::vector<WorldEntityId> result;
+    try {
+        std::lock_guard lock(mutex_);
+        if (!manifestLoaded_ || primitiveType == 0U) return result;
+        for (const auto& [id, entry] : entries_) {
+            if (entry.primitiveType != primitiveType) continue;
+            if (result.size() >= limit) break;
+            result.push_back(id);
+        }
+    } catch (...) {
+        result.clear();
+    }
+    return result;
+}
+
 std::optional<WorldEntityId> WorldEntityRegistry::IdentifyRuntimeEntity(
     const void* runtimeEntity,
     CathodeRuntimeKey* observedKey) const noexcept {

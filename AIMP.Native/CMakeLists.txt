@@ -26,6 +26,7 @@ set(AIMP_CORE_SOURCES
     src/AISyncHybridMotion.cpp
     src/AlienPvPControlRuntime.cpp
     src/AlienPvPLocalController.cpp
+    src/AlienPvPDoors.cpp
     src/AlienPvPInputIsolation.cpp
     src/CampaignSaveRuntime.cpp
     src/AlienPvPVisualIsolation.cpp
@@ -184,6 +185,12 @@ if(BUILD_TESTING)
     set_target_properties(AIMP.AlienPvPDonorControlTests PROPERTIES
         VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
     add_test(NAME AlienPvPDonorControl COMMAND AIMP.AlienPvPDonorControlTests)
+    add_executable(AIMP.AlienPvPFearTests tests/AlienPvPFearTests.cpp)
+    target_include_directories(AIMP.AlienPvPFearTests PRIVATE include)
+    target_compile_options(AIMP.AlienPvPFearTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+    set_target_properties(AIMP.AlienPvPFearTests PROPERTIES
+        VS_GLOBAL_VcpkgEnabled "false" VS_GLOBAL_VcpkgApplocalDeps "false")
+    add_test(NAME AlienPvPFear COMMAND AIMP.AlienPvPFearTests)
     add_executable(AIMP.WorldTransactionSkipTests tests/WorldTransactionSkipTests.cpp)
     target_link_libraries(AIMP.WorldTransactionSkipTests PRIVATE AIMP.Core)
     target_compile_options(AIMP.WorldTransactionSkipTests PRIVATE /W4 /WX /permissive- /EHsc /utf-8)

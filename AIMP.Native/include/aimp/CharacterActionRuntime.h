@@ -42,6 +42,15 @@ bool Install(const SignatureResolver& resolver, HookManager& hooks,
 void ObserveCreated(std::uintptr_t character, std::uint32_t spawnKey,
     std::uint64_t generation, bool aimpOwned) noexcept;
 void ForgetCharacter(std::uintptr_t character) noexcept;
+// AvS round 10 (flamethrower fear / kill block / shotgun stun on the Alien
+// pilot's PC): read-only view of a remote survivor proxy's replicated input.
+// aim/primary = the intent last published by the launcher's PlayerSync replay.
+// weapon = item class of the last successful remote equipment provision on
+// this Character: 0 unknown/other, 1 flamethrower, 2 shotgun.
+enum RemoteWeapon : std::uint8_t { WeaponUnknown=0, WeaponFlamethrower=1, WeaponShotgun=2 };
+struct RemoteIntent final { bool known{}, aim{}, primary{}; std::uint8_t weapon{}; std::int32_t slot{-1}; };
+[[nodiscard]] RemoteIntent QueryRemoteIntent(std::uintptr_t character) noexcept;
+void NoteRemoteWeapon(std::uintptr_t character, const char* compositeName) noexcept;
 void ForgetSpawnKey(std::uint32_t spawnKey) noexcept;
 void InvalidateGeneration(std::uint64_t generation) noexcept;
 

@@ -1,6 +1,8 @@
 #include <intrin.h>
 #include "aimp/AISync.h"
 #include "aimp/AlienPvPLocalController.h"
+#include "aimp/CharacterActionRuntime.h"
+#include "aimp/AlienPvPFear.h"
 #include "aimp/UIHeapGuard.h"
 #include "aimp/AlienPvPSpatialPolicy.h"
 #include "aimp/AlienPvPResponsiveStop.h"
@@ -13,6 +15,7 @@
 #include "aimp/AlienPvPAttackManager.h"
 #include "aimp/AlienPvPNativeActionAbi.h"
 #include "aimp/PlayerHidingRuntime.h"
+#include "aimp/AlienPvPDoors.h"
 #include <limits>
 #include "aimp/AISyncProfiling.h"
 #include "aimp/AISyncExecutionPolicy.h"
@@ -11134,6 +11137,8 @@ void PumpOnEngineThread() noexcept {
         localRequested?LocalPlayer():0U,
         static_cast<std::uint32_t>(pvpPhysicalGeneration),
         gPvPLease.ownerPeer,gCurrent.localPeer,localLease,localRequested};
+    pilotContext.selfPlayer=LocalPlayer();
+    pilotContext.alienAny=activeLease?gPvPLease.ticket.character:0U;
     if(localLease) {
         // Survivors on this PC (proxies of remote players; the local player is
         // the parked technical body of the pilot and is never a survivor).
@@ -11145,11 +11150,22 @@ void PumpOnEngineThread() noexcept {
                 !Read(character+0x78U,p[2]) || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]))return;
             for(std::uint32_t i=0;i<pilotContext.survivorCount;++i)
                 if(pilotContext.survivors[i][0]==p[0] && pilotContext.survivors[i][2]==p[2])return;
-            auto& out=pilotContext.survivors[pilotContext.survivorCount++];out[0]=p[0];out[1]=p[1];out[2]=p[2];
+            const auto index=pilotContext.survivorCount++;
+            auto& out=pilotContext.survivors[index];out[0]=p[0];out[1]=p[1];out[2]=p[2];
+            float yaw{};
+            if(Read(character+0x174U,yaw) && std::isfinite(yaw))pilotContext.survivorYaw[index]=yaw;
+            const auto intent=character_action_runtime::QueryRemoteIntent(character);
+            pilotContext.survivorWeapon[index]=intent.weapon;
+            pilotContext.survivorAim[index]=intent.aim;
+            pilotContext.survivorFiring[index]=intent.primary;
+            pilotContext.survivorHidden[index]=player_hiding::Hidden(character);
         };
         for(std::uint32_t i=0;i<gCurrent.participantCount;++i)addSurvivor(gCurrent.participants[i].peer);
     }
     alien_pvp_local::Pump(pilotContext);
+    // AvS pass 18: open unlocked doors near the Alien as present on this PC.
+    alien_pvp_doors::Pump((gCurrent.flags & kAlienPvP)!=0U && activeLease &&
+        LivingCharacter(gPvPLease.ticket.character)?gPvPLease.ticket.character:0U);
     SamplePvPSync(localLease,activeLease);
     PumpPlayerSpectate(static_cast<std::uint32_t>(pvpPhysicalGeneration),localRequested,
         (gCurrent.flags & kAlienPvP)!=0U?gPvPLease.ownerPeer:0U);
@@ -12006,7 +12022,67 @@ struct PvPReplicaTelemetry final {
     // Every observer pose (AvS 2026-11-25: replica 17 m off with fresh poses).
     std::atomic<std::uint64_t> poseApplied{},posePairBusy{},poseReserved{},poseCycle{},poseLease{},poseOther{};
     std::atomic<unsigned> poseLastCycle{};
+    // Pass 15: Host-piloted Alien stage repair on an observer.
+    std::atomic<std::uint64_t> stageToFront{},stageToBack{},stageRefused{},stageFailed{};
+    std::atomic<unsigned> stageLastCycle{};
+    // Pass 17: same-stage position snaps (replica stuck far from the Host pose).
+    std::atomic<std::uint64_t> snaps{},snapRefused{};
 } gPvPReplicaTelemetry;
+// Pass 15 (avsfix14: Host = Alien, survivor saw no Alien after a vent exit).
+// Host poses are not OwnerMeasured, so ReplicatePvPPose never runs on the
+// survivor PC; the replica's stage came only from generic replay, which missed
+// the picker exit (native exit walked 27 s backstage, timed out) and left it
+// backstage 40+ s next to the survivor (also visible at the vent after an entry
+// it never replayed). ControlRuntime calls this once the Host has stayed idle
+// in the other stage for 1 s. Same native setters as ReplicatePvPPose.
+bool ReconcilePvPReplicaStage(const alien_pvp::Context& context,const alien_pvp::Frame& pose) noexcept {
+    auto& t=gPvPReplicaTelemetry;
+    const auto refuse=[&](unsigned state) noexcept {
+        t.stageRefused.fetch_add(1U,std::memory_order_relaxed);t.stageLastCycle.store(state,std::memory_order_relaxed);return false;
+    };
+    if(context.localOwner || context.host || !context.owned || !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
+        context.character!=gPvPLease.ticket.character ||
+        (pose.flags&(alien_pvp::PoseValid|alien_pvp::NativeBusy))!=alien_pvp::PoseValid ||
+        !std::isfinite(pose.x) || !std::isfinite(pose.y) || !std::isfinite(pose.z) || !std::isfinite(pose.yaw))return refuse(0U);
+    if(PairSourceBusy(context.character) || PairReservedCharacter(context.character))return refuse(0U);
+    const bool backstage=(pose.flags&alien_pvp::Backstage)!=0U;
+    std::uintptr_t cycle{};std::uint8_t state{},a{},b{};
+    if(!Read(context.character+0x36CU,cycle)||!cycle||!Read(cycle+0x1AU,state)||
+        !Read(context.character+0x2DAU,a)||!Read(context.character+0x2DBU,b))return refuse(0U);
+    if((a||b)==backstage) {
+        // Pass 17: same stage = position snap (ControlRuntime RepairObserverPosition,
+        // replica stuck at a crawlspace hatch). Frontstage locomotion only.
+        if(backstage)return true;
+        if(state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U){
+            t.snapRefused.fetch_add(1U,std::memory_order_relaxed);t.stageLastCycle.store(state,std::memory_order_relaxed);return false;
+        }
+        const character_direct_step_runtime::MovementResourceLease snapResources(context.character);
+        if(!snapResources){t.snapRefused.fetch_add(1U,std::memory_order_relaxed);return false;}
+        const float at[]{pose.x,pose.y,pose.z};
+        if(!character_direct_step_runtime::ApplyAIRecoveryTransform(context.character,at,pose.yaw))
+            {t.snapRefused.fetch_add(1U,std::memory_order_relaxed);return false;}
+        t.snaps.fetch_add(1U,std::memory_order_relaxed);
+        return true;
+    }
+    // Idle in its stage only: never cut a passage (18/75), pair (78/79) or reaction.
+    if(state!=1U&&state!=55U&&state!=56U&&state!=57U&&state!=59U&&state!=77U)return refuse(state);
+    const character_direct_step_runtime::MovementResourceLease resources(context.character);
+    if(!resources)return refuse(state);
+    if(!backstage) {
+        std::uintptr_t withdrawal{};std::uint32_t withdrawState{};
+        if(ResolveAlienWithdrawContext(context.character,withdrawal,withdrawState) && withdrawState &&
+            !ApplyAlienWithdrawEntry(withdrawal,0U)){t.stageFailed.fetch_add(1U,std::memory_order_relaxed);return false;}
+    }
+    if(!SetCharacterBackstage(context.character,backstage)){t.stageFailed.fetch_add(1U,std::memory_order_relaxed);return false;}
+    if(!backstage) {
+        std::uint8_t invisible{};
+        if(Read(context.character+0x2D9U,invisible) && invisible)static_cast<void>(PvPShowReplica(context.character));
+    }
+    const float position[]{pose.x,pose.y,pose.z};
+    static_cast<void>(character_direct_step_runtime::ApplyAIRecoveryTransform(context.character,position,pose.yaw));
+    (backstage?t.stageToBack:t.stageToFront).fetch_add(1U,std::memory_order_relaxed);
+    return true;
+}
 bool ReplicatePvPPose(const alien_pvp::Context& context,const alien_pvp::Frame& pose) noexcept {
     auto& t=gPvPReplicaTelemetry;
     if(context.localOwner || !context.owned || !PvPLeaseScopeCurrent() || !PvPLeaseLiveIdentity() ||
@@ -12612,6 +12688,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
             peers+="]";
             const auto age=gPvPSync.correctionAgeMs.load();
             const auto& r=gPvPReplicaTelemetry;
+            const auto doors=alien_pvp_doors::Snapshot();
+            const auto puppet=alien_pvp::PuppetSnapshot();
             diagnostics.Log("info","alien_pvp_sync_probe",
                 "Where THIS PC draws the Alien and each other participant [x,y,z], once a second. Compare with the other PC's entry at the same time: the difference is that replica's drift. correction = last owner pose received (observers only). replica* = observer pose applications since start: applied, refused because the Alien is pair-busy / reserved by a pending pair replay / not in a mirrorable cycle (lastRefusedCycle) / movement lease busy / other.",
                 {{"host",Diagnostics::Boolean(gPvPSync.host.load()),true},
@@ -12630,13 +12708,46 @@ void LogDiagnostics(Diagnostics& diagnostics) {
                  {"replicaCycle",Diagnostics::Unsigned(r.poseCycle.load()),true},
                  {"lastRefusedCycle",Diagnostics::Unsigned(r.poseLastCycle.load()),true},
                  {"replicaLease",Diagnostics::Unsigned(r.poseLease.load()),true},
-                 {"replicaOther",Diagnostics::Unsigned(r.poseOther.load()),true}});
+                 {"replicaOther",Diagnostics::Unsigned(r.poseOther.load()),true},
+                 {"stageToFront",Diagnostics::Unsigned(r.stageToFront.load()),true},
+                 {"stageToBack",Diagnostics::Unsigned(r.stageToBack.load()),true},
+                 {"stageRefused",Diagnostics::Unsigned(r.stageRefused.load()),true},
+                 {"stageFailed",Diagnostics::Unsigned(r.stageFailed.load()),true},
+                 {"stageLastCycle",Diagnostics::Unsigned(r.stageLastCycle.load()),true},
+                 {"snaps",Diagnostics::Unsigned(r.snaps.load()),true},
+                 {"snapRefused",Diagnostics::Unsigned(r.snapRefused.load()),true},
+                 {"hiddenEdges",Diagnostics::Unsigned(player_hiding::History().hiddenEdges),true},
+                 {"doorsKnown",Diagnostics::Unsigned(doors.known),true},
+                 {"doorsPlaced",Diagnostics::Unsigned(doors.placed),true},
+                 {"doorOpens",Diagnostics::Unsigned(doors.opens),true},
+                 {"doorLocked",Diagnostics::Unsigned(doors.locked),true},
+                 {"doorFailed",Diagnostics::Unsigned(doors.failed),true},
+                 {"doorUnresolved",Diagnostics::Unsigned(doors.unresolved),true},
+                 {"lastDoorM",std::to_string(doors.lastDoorM),true},
+                 {"lockerKillAnims",Diagnostics::Unsigned(doors.lockerKillAnims),true},
+                 {"lockerKillInstances",Diagnostics::Unsigned(doors.lockerKillInstances),true},
+                 {"lockerKillResolved",Diagnostics::Unsigned(doors.lockerKillResolved),true},
+                 {"lockerBoxes",Diagnostics::Unsigned(doors.lockerBoxes),true},
+                 {"holdBreath",Diagnostics::Unsigned(doors.holdBreath),true},
+                 {"killtrapAnims",Diagnostics::Unsigned(doors.killtrapAnims),true},
+                 {"killtrapResolved",Diagnostics::Unsigned(doors.killtrapResolved),true},
+                 {"playAnimationTotal",Diagnostics::Unsigned(doors.playAnimationTotal),true},
+                 {"crawlPosesSent",Diagnostics::Unsigned(puppet.crawlPosesSent),true},
+                 {"crawlMirrorFrames",Diagnostics::Unsigned(puppet.crawlMirrorFrames),true},
+                 {"crawlHatchFrames",Diagnostics::Unsigned(puppet.crawlHatchFrames),true},
+                 {"crawlFallback",Diagnostics::Unsigned(puppet.crawlFallback),true},
+                 {"ownerBlendFrames",Diagnostics::Unsigned(puppet.ownerBlendFrames),true},
+                 {"crawlTailFrames",Diagnostics::Unsigned(puppet.crawlTailFrames),true},
+                 {"crawlTailDone",Diagnostics::Unsigned(puppet.crawlTailDone),true},
+                 {"blendThroughBusy",Diagnostics::Unsigned(puppet.blendThroughBusy),true},
+                 {"blendBlockedBusy",Diagnostics::Unsigned(puppet.blendBlockedBusy),true},
+                 {"blendInactive",Diagnostics::Unsigned(puppet.blendInactive),true}});
         }
     }
     {
         static std::uint64_t lastBlocked{},lastStalls{},lastLost{};
         const auto m=alien_pvp::MovementSnapshot();
-        const auto blocked=m.blockedAction+m.blockedVent+m.blockedStale+m.blockedStage;
+        const auto blocked=m.blockedAction+m.blockedVent+m.blockedStale+m.blockedStage+m.ventExpired*1000U+m.ventEpochCleared*1000U;
         const auto& s=pvp_actions::donorStallTelemetry;
         const auto stalls=s.stalls.load(),lost=s.requestsLost.load();
         if(blocked!=lastBlocked || stalls!=lastStalls || lost!=lastLost) {
@@ -12651,6 +12762,8 @@ void LogDiagnostics(Diagnostics& diagnostics) {
                  {"blockedStage",Diagnostics::Unsigned(m.blockedStage),true},
                  {"driveRefused",Diagnostics::Unsigned(m.driveRefused),true},
                  {"chaseDriven",Diagnostics::Unsigned(m.chaseDriven),true},
+                 {"ventExpired",Diagnostics::Unsigned(m.ventExpired),true},
+                 {"ventEpochCleared",Diagnostics::Unsigned(m.ventEpochCleared),true},
                  {"stalls",Diagnostics::Unsigned(stalls),true},
                  {"restarts",Diagnostics::Unsigned(s.restarts.load()),true},
                  {"requestsLost",Diagnostics::Unsigned(lost),true},
@@ -12674,13 +12787,22 @@ void LogDiagnostics(Diagnostics& diagnostics) {
         if(aim.aims!=lastAims) {
             lastAims=aim.aims;
             diagnostics.Log("info","alien_pvp_vent_camera",
-                "Vent-exit picker camera aimed at a new exit (debug point for the grey view into the duct). mode 1 physics rays found the open side of the room, 2 no physics world sampled (faced the nearest survivor), 3 neither (kept the mouse view), 4 elevated (ceiling) exit, probed 0.8-1.6 m above the room floor found below it, 5 no verified eye position (stayed on the probe point). Round 5: an eye must be reachable from its probe point, stand over a floor and see the exit. openM = free distance seen on the chosen side (-1 unknown); outM = metres the eye sits out from the exit (flat); liftM = eye height over the exit point (negative below a ceiling exit); floorDropM = room floor below the exit (0 = floor-level exit); ventHiddenFrames = frames a vent in reach was hidden behind geometry so E was not offered (session total); worlds = physics worlds probed.",
+                "Vent-exit picker camera aimed at a new exit (debug point for the grey view into the duct). Round 10: mode 6 stands on the room side of the vent axis (side +1/-1, sideOpenM free run), 7 ceiling vent faced the most open of 16 directions, 8 same without a floor drop; older modes: mode 1 physics rays found the open side of the room, 2 no physics world sampled (faced the nearest survivor), 3 neither (kept the mouse view), 4 elevated (ceiling) exit, probed 0.8-1.6 m above the room floor found below it, 5 no verified eye position (stayed on the probe point). Round 5: an eye must be reachable from its probe point, stand over a floor and see the exit. openM = free distance seen on the chosen side (-1 unknown); outM = metres the eye sits out from the exit (flat); liftM = eye height over the exit point (negative below a ceiling exit); floorDropM = room floor below the exit (0 = floor-level exit); ventHiddenFrames = frames a vent in reach was hidden behind geometry so E was not offered (session total); worlds = physics worlds probed.",
                 {{"vent",std::to_string(aim.vent),true},
                  {"mode",Diagnostics::Unsigned(aim.mode),true},
                  {"openM",std::to_string(aim.open),true},
                  {"outM",std::to_string(aim.out),true},
                  {"liftM",std::to_string(aim.lift),true},
                  {"floorDropM",std::to_string(aim.floorDrop),true},
+                 {"axisM",std::to_string(aim.axis),true},
+                 {"side",std::to_string(aim.side),true},
+                 {"sideOpenM",std::to_string(aim.sideOpen),true},
+                 {"levels",Diagnostics::Unsigned(aim.levels),true},
+                 {"level",Diagnostics::Unsigned(aim.level),true},
+                 {"upClearM",std::to_string(aim.upClear),true},
+                 {"throughDyM",std::to_string(aim.throughDy),true},
+                 {"throughOk",Diagnostics::Unsigned(aim.throughOk),true},
+                 {"throughFail",Diagnostics::Unsigned(aim.throughFail),true},
                  {"ventHiddenFrames",Diagnostics::Unsigned(aim.ventHidden),true},
                  {"worlds",Diagnostics::Unsigned(aim.worlds),true},
                  {"aims",Diagnostics::Unsigned(aim.aims),true}});
@@ -12705,6 +12827,80 @@ void LogDiagnostics(Diagnostics& diagnostics) {
                  {"selfHits",Diagnostics::Unsigned(aim.selfHits),true},
                  {"blockedOffered",Diagnostics::Unsigned(aim.blockedOffered),true},
                  {"hitFromStartM",std::to_string(aim.hitFromStart),true}});
+        }
+    }
+    {
+        // AvS round 10: crawlspace mode on the Alien player's PC.
+        static std::uint64_t lastCrawlKey{};
+        const auto crawl=alien_pvp_local::CrawlSnapshot();
+        const auto& ct=pvp_actions::crawlTelemetry;
+        const std::uint64_t key=crawl.entries*3U+crawl.ductToggles*5U+crawl.frames*7U+crawl.firstPersonFailed*11U+
+            ct.moves.load()*13U+ct.failed.load()*17U+ct.refused.load()*19U+crawl.headReleased*23U+crawl.menuExits*29U+crawl.cameraLost*31U;
+        if(key!=lastCrawlKey) {
+            lastCrawlKey=key;
+            diagnostics.Log("info","alien_pvp_crawl",
+                "Round 10 crawlspaces (Alien PC). duct = low ceiling over the Alien now (ray +0.4..+1.4 m, 4-sample hysteresis), ductX/Z where it last toggled; entries = C presses (3 s push into the hatch); frames = frames in crawl mode; firstPersonOn/Failed = head-camera switches. Path move (retail 0030A940 toward a goal 2.4/1.2 m ahead): starts, moves, arrived, failed (plan refused), stops, refused (slot quarantined), lastResult (0 running, 1 arrived, other failed), lastGoalM.",
+                {{"duct",Diagnostics::Boolean(crawl.duct),true},
+                 {"ductX",std::to_string(crawl.ductX),true},
+                 {"ductZ",std::to_string(crawl.ductZ),true},
+                 {"ductToggles",Diagnostics::Unsigned(crawl.ductToggles),true},
+                 {"entries",Diagnostics::Unsigned(crawl.entries),true},
+                 {"frames",Diagnostics::Unsigned(crawl.frames),true},
+                 {"firstPersonOn",Diagnostics::Unsigned(crawl.firstPersonOn),true},
+                 {"firstPersonFailed",Diagnostics::Unsigned(crawl.firstPersonFailed),true},
+                 {"headReleased",Diagnostics::Unsigned(crawl.headReleased),true},
+                 {"menuExits",Diagnostics::Unsigned(crawl.menuExits),true},
+                 {"cameraLost",Diagnostics::Unsigned(crawl.cameraLost),true},
+                 {"starts",Diagnostics::Unsigned(ct.starts.load()),true},
+                 {"moves",Diagnostics::Unsigned(ct.moves.load()),true},
+                 {"arrived",Diagnostics::Unsigned(ct.arrived.load()),true},
+                 {"failed",Diagnostics::Unsigned(ct.failed.load()),true},
+                 {"stops",Diagnostics::Unsigned(ct.stops.load()),true},
+                 {"refused",Diagnostics::Unsigned(ct.refused.load()),true},
+                 {"lastResult",std::to_string(ct.lastResult.load()),true},
+                 {"lastGoalM",std::to_string(ct.lastGoalM.load()),true}});
+        }
+    }
+    {
+        // AvS round 10: flamethrower fear meter on the Alien player's PC.
+        static std::uint64_t lastKey{};
+        const auto fear=alien_pvp_local::FearSnapshot();
+        const std::uint64_t key=fear.flamedFrames*31U+fear.threatFrames*17U+fear.retreats*7U+fear.flinches*5U+
+            fear.stuns*3U+fear.blockedClicks*11U+fear.exitRefused*13U+fear.retreatSent*19U+fear.phase*23U+
+            fear.survivorWeapons*29U+static_cast<std::uint64_t>(fear.meter)+fear.reactions*37U+fear.survivorStunned*41U+fear.survivorStunMissed*43U+fear.stunRoars*47U+fear.oddCycles*53U+fear.lockerClicks*59U;
+        if(key!=lastKey) {
+            lastKey=key;
+            diagnostics.Log("info","alien_pvp_fear",
+                "Round 10 flamethrower fear (Alien PC). meter % (retreat at 50, refill backstage), resistance 0..0.75 (+0.25 per retreat), phase 0 normal / 1 retreating / 2 recovering (exit refused under 100%). flamedFrames = frames a firing flamethrower survivor had the Alien in range+cone; threatFrames = flamethrower aimed/fired at it within 5 m (kill blocked); survivorWeapons = 4 bits/survivor: weapon(1 flame, 2 shotgun) | aim<<2 | firing<<3; flamerAngle = last facing->Alien angle (rad).",
+                {{"meter",std::to_string(fear.meter),true},
+                 {"resistance",std::to_string(fear.resistance),true},
+                 {"phase",Diagnostics::Unsigned(fear.phase),true},
+                 {"retreats",Diagnostics::Unsigned(fear.retreats),true},
+                 {"chaseRetreats",Diagnostics::Unsigned(fear.chaseRetreats),true},
+                 {"flinches",Diagnostics::Unsigned(fear.flinches),true},
+                 {"stuns",Diagnostics::Unsigned(fear.stuns),true},
+                 {"blockedClicks",Diagnostics::Unsigned(fear.blockedClicks),true},
+                 {"exitRefused",Diagnostics::Unsigned(fear.exitRefused),true},
+                 {"retreatSent",Diagnostics::Unsigned(fear.retreatSent),true},
+                 {"retreatAbandoned",Diagnostics::Unsigned(fear.retreatAbandoned),true},
+                 {"retreatVentM",std::to_string(fear.retreatVentM),true},
+                 {"flamedFrames",Diagnostics::Unsigned(fear.flamedFrames),true},
+                 {"threatFrames",Diagnostics::Unsigned(fear.threatFrames),true},
+                 {"flamerAngle",std::to_string(fear.flamerAngle),true},
+                 {"survivorWeapons",Diagnostics::Unsigned(fear.survivorWeapons),true},
+                 {"reactions",Diagnostics::Unsigned(fear.reactions),true},
+                 {"stunRoars",Diagnostics::Unsigned(fear.stunRoars),true},
+                 {"survivorStunned",Diagnostics::Unsigned(fear.survivorStunned),true},
+                 {"survivorStunMissed",Diagnostics::Unsigned(fear.survivorStunMissed),true},
+                 {"reactSubmitted",Diagnostics::Unsigned(pvp_actions::reactionTelemetry.submitted.load()),true},
+                 {"reactAdmitted",Diagnostics::Unsigned(pvp_actions::reactionTelemetry.admitted.load()),true},
+                 {"reactRefused",Diagnostics::Unsigned(pvp_actions::reactionTelemetry.refused.load()),true},
+                 {"reactUnknown",Diagnostics::Unsigned(pvp_actions::reactionTelemetry.unknown.load()),true},
+                 {"reactLastType",Diagnostics::Unsigned(pvp_actions::reactionTelemetry.lastType.load()),true},
+                 {"reactLastOutcome",Diagnostics::Unsigned(pvp_actions::reactionTelemetry.lastOutcome.load()),true},
+                 {"oddCycles",Diagnostics::Unsigned(fear.oddCycles),true},
+                 {"lockerClicks",Diagnostics::Unsigned(fear.lockerClicks),true},
+                 {"cycleTrail",fear.cycleTrail.empty()?std::string("[]"):fear.cycleTrail,true}});
         }
     }
     {

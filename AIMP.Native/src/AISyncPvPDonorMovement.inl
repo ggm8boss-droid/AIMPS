@@ -158,6 +158,74 @@ bool DriveDonor(const ap::Context& c,const ap::Frame* input) noexcept {
     }
     return outcome==transactions::NativeOutcome::Admitted;
 }
+// AvS round 10: retail reaction actions on the pilot's Alien. A kind-5 action
+// request whose +1C is the action type (= the cycle number in our logs; the
+// kill pair is 0x4E AT_ALIEN_MELEE_GRAPPLE, replayed the same way by AISync).
+// 87 AT_AFFECTED_BY_FLAME_THROWER (retreat recoil), 80 AT_IMPACT_STUMBLE
+// (flinch), 86 AT_MULTI_STAGE_STUNNED (shotgun stun). Retired after its window.
+struct Reaction final {
+    std::unique_ptr<execution::NativeRequestAdapter> adapter{};
+    ap::Context context{};transactions::Record command{};
+    bool used{},fault{};std::uint64_t until{};std::uint32_t nextId{1U};
+} reaction{};
+struct ReactionTelemetry final {
+    std::atomic<std::uint64_t> submitted{},admitted{},refused{},unknown{},retired{};
+    std::atomic<std::uint32_t> lastType{},lastOutcome{0xFFU};
+} reactionTelemetry;
+bool ReactionPermission(void* opaque,const transactions::Record& r) noexcept {
+    const auto& d=*static_cast<Reaction*>(opaque);
+    const bool cleanup=r.opcode==transactions::Op::Cancel || r.opcode==transactions::Op::Release;
+    return Live(d.context) && r.scope==d.command.scope && r.owner==d.command.owner &&
+        r.commandId==d.command.commandId && r.nativeKind==execution::kActionKind &&
+        (cleanup || (PvPLeaseScopeCurrent() && !gPvPLease.releasing));
+}
+bool ReactionResolve(void* opaque,const transactions::OwnerKey& owner,execution::LocalActorBinding& actor) noexcept {
+    const auto& d=*static_cast<Reaction*>(opaque);
+    if(!Live(d.context) || owner!=d.command.owner)return false;
+    actor={d.context.character,gPvPLease.runtimeId,true,gPvPLease.ticket.serial};return true;
+}
+bool RetireReaction(const ap::Context& c) noexcept {
+    if(!reaction.used)return true;
+    if(!Live(c) || reaction.fault)return false;
+    auto cleanup=reaction.command;cleanup.opcode=transactions::Op::Cancel;
+    if(reaction.adapter->Invoke(cleanup)!=transactions::NativeOutcome::Admitted)return false;
+    cleanup.opcode=transactions::Op::Release;
+    if(reaction.adapter->Invoke(cleanup)!=transactions::NativeOutcome::Admitted)return false;
+    reaction.used=false;reactionTelemetry.retired.fetch_add(1U,std::memory_order_relaxed);return true;
+}
+bool PlayReaction(const ap::Context& c,std::uint32_t type,std::uint64_t windowMs) noexcept {
+    if(!Live(c) || !c.localOwner || !PvPLeaseScopeCurrent() || gPvPLease.releasing || type>0xFFU ||
+        type==execution::kActionNoState || reaction.fault)return false;
+    if(!RetireReaction(c) || !StopDonor(c))return false;
+    if(!reaction.adapter)reaction.adapter=std::unique_ptr<execution::NativeRequestAdapter>(new(std::nothrow) execution::NativeRequestAdapter);
+    if(!reaction.adapter || (reaction.adapter->ActiveCount()==0U &&
+        !reaction.adapter->Initialize(c.base,true,&ReactionPermission,&ReactionResolve,&reaction)))return false;
+    reaction.context=c;reaction.command={};
+    auto& r=reaction.command;
+    std::memcpy(r.scope.session.data(),&c.scope.cookie,sizeof(c.scope.cookie));
+    r.scope.authorityEpoch=c.scope.ownerPeer;r.scope.worldEpoch=c.scope.worldGeneration;
+    r.scope.consumerEpoch=c.scope.nativeGeneration;
+    r.owner={c.scope.entityA,c.scope.entityB,gPvPLease.runtimeId,1U,
+        transactions::Capability::Movement,c.scope.incarnation};
+    r.commandId=r.globalSeq=r.ownerSeq=reaction.nextId++;r.parameterRevision=1U;
+    r.nativeKind=execution::kActionKind;r.mode=type;r.gait=0U;r.opcode=transactions::Op::Submit;
+    reactionTelemetry.submitted.fetch_add(1U,std::memory_order_relaxed);
+    reactionTelemetry.lastType.store(type,std::memory_order_relaxed);
+    const auto outcome=reaction.adapter->Invoke(r);
+    reactionTelemetry.lastOutcome.store(static_cast<std::uint32_t>(outcome),std::memory_order_relaxed);
+    if(outcome==transactions::NativeOutcome::Unknown){reaction.fault=true;reactionTelemetry.unknown.fetch_add(1U,std::memory_order_relaxed);return false;}
+    if(outcome!=transactions::NativeOutcome::Admitted || reaction.adapter->ActiveCount()==0U) {
+        reactionTelemetry.refused.fetch_add(1U,std::memory_order_relaxed);return false;
+    }
+    reaction.used=true;reaction.until=GetTickCount64()+windowMs;
+    reactionTelemetry.admitted.fetch_add(1U,std::memory_order_relaxed);
+    return true;
+}
+// Called every pilot frame (ActionHooks::react with type 0).
+bool PumpReaction(const ap::Context& c) noexcept {
+    if(reaction.used && GetTickCount64()>=reaction.until)static_cast<void>(RetireReaction(c));
+    return reaction.used;
+}
 // Keep SEH inside a scalar-only helper; the caller owns the native resource pin.
 void PilotResponsiveWrite(DonorMovement& d,std::uintptr_t loco,std::uint8_t state) noexcept {
     const auto& c=d.context;
@@ -217,4 +285,6 @@ void DonorDestroyed(std::uintptr_t character,std::uint32_t runtime,std::uint64_t
 }
 #else
 bool StopDonor(const ap::Context&) noexcept {return true;}
+bool PlayReaction(const ap::Context&,std::uint32_t,std::uint64_t) noexcept {return false;}
+bool PumpReaction(const ap::Context&) noexcept {return false;}
 #endif

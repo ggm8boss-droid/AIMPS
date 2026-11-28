@@ -389,6 +389,10 @@ public:
     [[nodiscard]] bool IsPlayerMissionCompleteEndpoint(const WorldEntityId& id) const noexcept;
     [[nodiscard]] std::optional<std::uint32_t> FindWorldEntityPrimitiveType(
         const WorldEntityId& id) const noexcept;
+    // AvS pass 18: every manifest entity of one primitive type (e.g. Door),
+    // at most `limit`. Empty while no manifest is loaded.
+    [[nodiscard]] std::vector<WorldEntityId> FindWorldEntitiesOfPrimitiveType(
+        std::uint32_t primitiveType, std::size_t limit) const noexcept;
     [[nodiscard]] std::optional<WorldEntityId> IdentifyRuntimeEntity(
         const void* runtimeEntity,
         CathodeRuntimeKey* observedKey = nullptr) const noexcept;

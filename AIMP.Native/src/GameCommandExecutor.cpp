@@ -4030,6 +4030,10 @@ GameCommandExecutionResult GameCommandExecutor::ExecuteRemoteEquipmentProvision(
         command.spawnTargetInputShortGuid,
         command.equipmentSlot, command.activateHeld, command.releaseHeld);
     result.executed = provision.executed;
+    // AvS round 10: remember which item class this survivor proxy now holds
+    // (the Alien pilot's flame fear / kill block / shotgun stun read it).
+    if (provision.executed)
+        character_action_runtime::NoteRemoteWeapon(command.characterAddress, command.compositeName.c_str());
     if (!provision.executed && provision.retryable) {
         // LauncherIPC preserves REMOTE_EQUIPMENT_NOT_READY as a convergence result.
         // Keep the detailed native stage in the message for diagnostics.

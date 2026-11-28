@@ -1769,8 +1769,60 @@ void ObserveCreated(const std::uintptr_t character, const std::uint32_t spawnKey
     } catch (...) { }
 }
 
+namespace {
+struct RemoteWeaponEntry { std::uintptr_t character{}; std::uint8_t weapon{}; };
+std::array<RemoteWeaponEntry, 16> gRemoteWeapons{}; // guarded by gRuntime.mutex
+bool ContainsNoCase(const char* text, const char* needle) noexcept {
+    if (text == nullptr) return false;
+    for (const char* t = text; *t != '\0'; ++t) {
+        const char* a = t; const char* b = needle;
+        while (*a != '\0' && *b != '\0' &&
+            (*a == *b || (*a >= 'A' && *a <= 'Z' && *a + 32 == *b))) { ++a; ++b; }
+        if (*b == '\0') return true;
+    }
+    return false;
+}
+} // namespace
+
+void NoteRemoteWeapon(const std::uintptr_t character, const char* compositeName) noexcept {
+    if (character == 0U) return;
+    const std::uint8_t weapon = ContainsNoCase(compositeName, "flamethrower") ? WeaponFlamethrower :
+        ContainsNoCase(compositeName, "shotgun") ? WeaponShotgun : WeaponUnknown;
+    try {
+        std::lock_guard lock(gRuntime.mutex);
+        RemoteWeaponEntry* slot{};
+        for (auto& entry : gRemoteWeapons) {
+            if (entry.character == character) { slot = &entry; break; }
+            if (slot == nullptr && entry.character == 0U) slot = &entry;
+        }
+        if (slot == nullptr) slot = &gRemoteWeapons[character % gRemoteWeapons.size()];
+        *slot = {character, weapon};
+    } catch (...) { }
+}
+
+RemoteIntent QueryRemoteIntent(const std::uintptr_t character) noexcept {
+    RemoteIntent out{};
+    if (character == 0U) return out;
+    try {
+        std::lock_guard lock(gRuntime.mutex);
+        for (const auto& entry : gRemoteWeapons)
+            if (entry.character == character) { out.weapon = entry.weapon; break; }
+        if (const auto* session = FindSession(character); session != nullptr) {
+            out.known = true;
+            out.aim = session->aimRequested;
+            out.primary = session->primaryRequested;
+            out.slot = session->slot;
+        }
+    } catch (...) { }
+    return out;
+}
+
 void ForgetCharacter(const std::uintptr_t character) noexcept {
-    try { std::lock_guard lock(gRuntime.mutex); ForgetLocked(character); } catch (...) { }
+    try {
+        std::lock_guard lock(gRuntime.mutex);
+        ForgetLocked(character);
+        for (auto& entry : gRemoteWeapons) if (entry.character == character) entry = {};
+    } catch (...) { }
 }
 
 void ForgetSpawnKey(const std::uint32_t spawnKey) noexcept {

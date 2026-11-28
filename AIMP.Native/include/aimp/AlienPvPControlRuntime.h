@@ -19,6 +19,9 @@ struct LocalInput final {
     bool focused{};
     bool selectedVent{};
     float ventX{},ventY{},ventZ{};
+    // AvS round 10: crawlspace mode (duct or C entry window): the owner drives
+    // a retail path move instead of the kind9 direction move.
+    bool crawl{};
 };
 // Engine-thread calls. No camera/input/character pointer crosses IPC.
 void CaptureLocal(const LocalInput& input) noexcept;
@@ -31,6 +34,11 @@ bool VentPending() noexcept;
 // HUD only: a vent request really in flight / a non-vent (attack) action busy.
 bool VentRequestPending() noexcept;
 bool NonVentActionBusy() noexcept;
+// AvS round 10: retail reaction action on this PC's piloted Alien (owner only).
+bool PlayReaction(std::uint32_t type,std::uint64_t windowMs) noexcept;
+// AvS round 10: a stun roar Commit arrived (once per roar); yaw = direction
+// from the Alien to the survivor it stuns.
+bool TakeStunRoar(float& yaw) noexcept;
 bool ControlActive() noexcept;
 // Worker-thread calls. Queues hold copied frames, never native resources.
 bool QueueCommand(std::span<const std::byte> bytes) noexcept;
@@ -48,6 +56,26 @@ bool LastCorrection(Frame& frame,std::uint64_t& ageMs) noexcept;
 struct MovementStats final {
     std::uint64_t heldFrames{},drivenFrames{},blockedAction{},blockedVent{},blockedStale{},blockedStage{},driveRefused{};
     std::uint64_t chaseDriven{}; // AvS round 5: frames the auto-chase drove the Alien
+    // Pass 10: vent requests dropped locally because no Host answer arrived
+    // (Preparing > 4 s, Started > 30 s) or the possession epoch changed.
+    std::uint64_t ventExpired{},ventEpochCleared{};
 };
 MovementStats MovementSnapshot() noexcept;
+// AvS pass 19 owner presentation on observers (puppet Alien).
+// crawlPosesSent = poses this pilot flagged Crawling; crawlMirrorFrames = observer
+// frames driving the replica with the retail crawl path toward the owner pose;
+// crawlHatchFrames = observer frames the replica was in its own hatch traversal
+// (18) while mirroring; ownerBlendFrames = frames the owner-pose blend
+// (committed input + replicatePose) ran; crawlFallback = mirroring dropped to the
+// blend because the replica was > 4 m behind.
+// Pass 20: crawlTailFrames = frames the copy kept crawling toward the owner after
+// the owner left the duct (climbs out itself); crawlTailDone = tails that caught
+// up; blendThroughBusy / blendBlockedBusy = observer frames with an open action
+// receipt that still followed the owner pose / were held (replica in a native
+// action); blendInactive = owner-pose blend frames with an inactive input window.
+struct PuppetStats final {
+    std::uint64_t crawlPosesSent{},crawlMirrorFrames{},crawlHatchFrames{},ownerBlendFrames{},crawlFallback{};
+    std::uint64_t crawlTailFrames{},crawlTailDone{},blendThroughBusy{},blendBlockedBusy{},blendInactive{};
+};
+PuppetStats PuppetSnapshot() noexcept;
 } // namespace aimp::alien_pvp

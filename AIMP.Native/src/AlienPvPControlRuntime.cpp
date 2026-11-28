@@ -19,7 +19,12 @@ std::mutex gQueueMutex;
 Mailbox<64> gIncoming,gOutgoing;
 std::atomic<std::uint64_t> gReceived{},gRejected{},gExpired{},gDropped{},gInputs{},gCommits{},gPoses{},gCorrections{},gUnsupported{};
 std::atomic<std::uint64_t> gHeld{},gDriven{},gBlockedAction{},gBlockedVent{},gBlockedStale{},gBlockedStage{},gDriveRefused{};
-std::atomic<std::uint64_t> gChaseDriven{};
+std::atomic<std::uint64_t> gChaseDriven{},gVentExpired{},gVentEpochCleared{},gStageRepaired{};
+std::atomic<std::uint64_t> gCrawlPosesSent{},gCrawlMirror{},gCrawlHatch{},gOwnerBlend{},gCrawlFallback{};
+// Pass 20: crawl tail (copy climbing out after the owner left the duct) and the
+// observer blend running through a stuck action (avsfix19: frozen after a kill).
+std::atomic<std::uint64_t> gCrawlTail{},gCrawlTailDone{},gBlendThroughBusy{},gBlendBlockedBusy{},gBlendInactive{};
+std::atomic<std::uint64_t> gStunRoarAt{},gStunRoarTaken{};std::atomic<float> gStunRoarYaw{};
 struct State final {
     Context context{};InputWindow window{};PredictionHistory history{};
     DeliveryInbox inbox{};DeliveryOutbox<> outbox{};bool deliveryFault{};std::uint64_t deliveryGeneration{};
@@ -28,11 +33,19 @@ struct State final {
     std::uint64_t inputSequence{},poseSequence{},lastInputSent{},lastStatus{},lastPose{},lastTick{},lastAckAt{},lastRoar{};
     std::uint64_t appliedInput{},appliedHost{},correctionAt{};
     Frame correction{},lastObserved{},ventAuthority{},deferredTerminal{};
+    std::uint64_t ventAuthorityAt{}; // when ventAuthority last changed
     bool hasDeferredTerminal{};
     bool moving{},hadPose{},ownsSlot{},expired{},recovering{},hasDeferredAction{},aligned{};
     Frame deferredAction{};std::uint64_t deferredActionAt{};
     std::uint64_t ventSettleSequence{},ventSettleAt{};
     float correctionX{},correctionZ{};bool predictionCorrection{};
+    // Pass 15: observer of a Host-piloted Alien, replica stage != Host stage.
+    std::uint64_t stageMismatchSince{},stageAttemptAt{};
+    // Pass 17: observer replica stuck far from the Host pose (crawlspace hatch).
+    std::uint64_t positionMismatchSince{},positionAttemptAt{};
+    // Pass 19: observer replica driven by the owner's crawl (MirrorOwnerCrawl).
+    bool crawlMirroring{};
+    std::uint64_t crawlSeenAt{}; // pass 20: last fresh owner pose flagged Crawling
 };
 State g{}; // certified engine thread only
 // A possession can restart on the SAME native Character/scope. A distinct
@@ -118,11 +131,21 @@ void ReleaseCarrier() noexcept {
     if(g.ownsSlot && character_direct_step_runtime::ReleaseAIIntentOwnership(g.context.character))g.ownsSlot=false;
     g.moving=false;
 }
+void SetVentAuthority(const Frame& frame,std::uint64_t now) noexcept {
+    g.ventAuthority=frame;g.ventAuthorityAt=now;
+}
+// AvS pass 10 (2026-11-26): the HUD stayed on "Entering ventilation... E / Q"
+// and the Alien never moved again. An E press marks ventAuthority Preparing on
+// the pilot's PC at once; the Host had just revoked the possession epoch (crawl
+// first-person switch), so that intent was never committed and no Resolution
+// ever arrived. Nothing cleared Preparing, which blocks all movement. A vent
+// request without a Host answer now expires; the native action, when one is
+// running here, keeps its own bounded timeouts (ActionBusy skips this).
 void PublishAction(Frame result,std::uint64_t now) noexcept {
-    if(g.context.host && (result.action==Action::EnterVent || result.action==Action::ExitVent))g.ventAuthority=result;
+    if(g.context.host && (result.action==Action::EnterVent || result.action==Action::ExitVent))SetVentAuthority(result,now);
     if(g.context.localOwner && result.phase==ActionPhase::Completed &&
         (result.action==Action::EnterVent || result.action==Action::ExitVent) &&
-        result.hostSequence==g.ventAuthority.hostSequence)g.ventAuthority=result;
+        result.hostSequence==g.ventAuthority.hostSequence)SetVentAuthority(result,now);
     result.scope=g.context.scope;result.flags=Flags(now);
     result.kind=g.context.host && result.action!=Action::Roar?Kind::Resolution:Kind::ActionResult;
     if(result.phase==ActionPhase::Started || result.phase==ActionPhase::Completed) {
@@ -144,10 +167,24 @@ bool CancelRecovery() noexcept {
     g.recovering=!retired;return retired;
 }
 bool StopDonorMovement() noexcept {
-    return !g.context.actions || !g.context.actions->drive || g.context.actions->drive(g.context,nullptr);
+    // Round 10: a running crawl path move is movement too; retire it first.
+    const bool crawlStopped=!g.context.actions || !g.context.actions->crawl || g.context.actions->crawl(g.context,nullptr);
+    return crawlStopped && (!g.context.actions || !g.context.actions->drive || g.context.actions->drive(g.context,nullptr));
 }
 bool VentAction(const Frame& frame) noexcept {
     return frame.action==Action::EnterVent || frame.action==Action::ExitVent;
+}
+constexpr std::uint64_t kVentRequestTimeoutMs=4000U,kVentRunTimeoutMs=30000U;
+void ExpireVentAuthority(std::uint64_t now) noexcept {
+    if(!VentAction(g.ventAuthority) || g.hasDeferredAction || ActionBusy())return;
+    const auto phase=g.ventAuthority.phase;
+    const auto limit=phase==ActionPhase::Preparing?kVentRequestTimeoutMs:
+        phase==ActionPhase::Started?kVentRunTimeoutMs:0U;
+    if(!limit)return;
+    if(!g.ventAuthorityAt || now<g.ventAuthorityAt){g.ventAuthorityAt=now;return;}
+    if(now-g.ventAuthorityAt<limit)return;
+    g.ventAuthority.phase=ActionPhase::Failed;g.ventAuthority.reason=ActionReason::Timeout;g.ventAuthorityAt=now;
+    gVentExpired.fetch_add(1U,std::memory_order_relaxed);
 }
 bool SettleVent(const Frame& frame,std::uint64_t now) noexcept {
     if(!VentAction(frame))return false;
@@ -174,6 +211,12 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
         } else if(g.context.actions && g.context.actions->interruptVent &&
             g.context.actions->interruptVent(g.context,result))PublishAction(result,now);
         return;
+    }
+    if(command.action==Action::Roar && command.pitch>1.4F) {
+        // Round 10 stun roar (Alien flamed during a chase): every PC gets the
+        // pilot's Commit; the survivor in the yaw direction stuns itself.
+        gStunRoarYaw.store(command.yaw,std::memory_order_relaxed);
+        gStunRoarAt.store(now,std::memory_order_release);
     }
     if(command.action==Action::Roar) {
         result.phase=ActionPhase::Rejected;result.reason=ActionReason::NativeBusy;
@@ -203,7 +246,7 @@ void ApplyAction(const Frame& command,std::uint64_t now) noexcept {
 }
 void ApplyResolution(const Frame& plan,std::uint64_t now) noexcept {
     if(g.context.host)return;
-    if(plan.action==Action::EnterVent || plan.action==Action::ExitVent)g.ventAuthority=plan;
+    if(plan.action==Action::EnterVent || plan.action==Action::ExitVent)SetVentAuthority(plan,now);
     // Host may finish a short exit within our 300ms settling interval. Its
     // Completed receipt must not discard the queued local Started operation.
     if(VentAction(plan) && plan.phase==ActionPhase::Completed && g.hasDeferredAction &&
@@ -278,6 +321,13 @@ void Drain(std::uint64_t now) noexcept {
             gRejected.fetch_add(1U,std::memory_order_relaxed);continue;
         }
         if(f.kind==Kind::Stop){g.deliveryFault=false;g.hasDeferredAction=false;g.hasDeferredTerminal=false;}
+        // Pass 10: a revoked/regranted epoch drops every uncommitted intent of
+        // the old one, and cancel() below ends any native vent run here. A vent
+        // request still marked Preparing/Started would never be answered.
+        if((f.kind==Kind::Stop || (f.kind==Kind::Activate && previousEpoch!=f.epoch)) && VentAction(g.ventAuthority) &&
+            (g.ventAuthority.phase==ActionPhase::Preparing || g.ventAuthority.phase==ActionPhase::Started)) {
+            g.ventAuthority={};g.ventAuthorityAt=0U;gVentEpochCleared.fetch_add(1U,std::memory_order_relaxed);
+        }
         if(f.kind==Kind::Stop || (f.kind==Kind::Activate && previousEpoch!=f.epoch)) {
             if(g.context.actions && g.context.actions->cancel)g.context.actions->cancel(g.context,true);
         }
@@ -328,7 +378,112 @@ void StopMovement() noexcept {
     }
     g.moving=false;
 }
+// Pass 15 (avsfix14): on a survivor PC with the Host piloting the Alien, the
+// replica's stage only comes from generic replay, which can miss a vent exit
+// or entry (seen: hidden backstage 40+ s beside the survivor). Once the Host
+// has been idle in the other stage for kStageRepairMs, put the replica there.
+constexpr std::uint64_t kStageRepairMs=1000U;
+void RepairObserverStage(std::uint64_t now) noexcept {
+    if(g.context.host || g.context.localOwner || !g.context.actions || !g.context.actions->reconcileStage ||
+        !g.correctionAt || (g.correction.flags&OwnerMeasured)!=0U){g.stageMismatchSince=0U;return;}
+    std::uint8_t state{};bool backstage{};
+    if(!NativeStage(g.context.character,state,backstage) || (g.correction.flags&PoseValid)==0U ||
+        backstage==((g.correction.flags&Backstage)!=0U)){g.stageMismatchSince=0U;return;}
+    // Host still in a passage/pair (NativeBusy) or its pose is stale: wait.
+    if((g.correction.flags&NativeBusy)!=0U || !Fresh(now,g.correctionAt,300U)){g.stageMismatchSince=0U;return;}
+    if(!g.stageMismatchSince){g.stageMismatchSince=now;return;}
+    if(now-g.stageMismatchSince<kStageRepairMs || (g.stageAttemptAt && now-g.stageAttemptAt<500U))return;
+    g.stageAttemptAt=now;
+    if(g.context.actions->reconcileStage(g.context,g.correction)) {
+        gStageRepaired.fetch_add(1U,std::memory_order_relaxed);
+        g.stageMismatchSince=0U;
+    }
+}
+// Pass 17 (avsfix16 test): the replica's generic route cannot take a crawlspace
+// hatch. It stood at the hatch while the Host crawled through, then walked the
+// long way round (error 9-10 m for ~10 s). Same stage, Host pose fresh and not
+// busy, replica > kSnapPlanarM away (or another height) for kSnapAfterMs ->
+// place it at the Host pose (reconcileStage with an equal stage = snap).
+constexpr float kSnapPlanarM=3.0F,kSnapVerticalM=1.2F;
+constexpr std::uint64_t kSnapAfterMs=700U,kSnapRetryMs=400U;
+void RepairObserverPosition(std::uint64_t now) noexcept {
+    const auto reset=[]() noexcept {g.positionMismatchSince=0U;};
+    if(g.context.host || g.context.localOwner || !g.context.actions || !g.context.actions->reconcileStage ||
+        !g.correctionAt || (g.correction.flags&OwnerMeasured)!=0U){reset();return;}
+    if((g.correction.flags&(PoseValid|NativeBusy|Backstage))!=PoseValid || !Fresh(now,g.correctionAt,500U)){reset();return;}
+    std::uint8_t state{};bool backstage{};Frame here{};
+    if(!NativeStage(g.context.character,state,backstage) || backstage || !ReadPose(here)){reset();return;}
+    const float dx=g.correction.x-here.x,dz=g.correction.z-here.z,dy=g.correction.y-here.y;
+    if(!std::isfinite(dx) || !std::isfinite(dz) || !std::isfinite(dy) ||
+        (dx*dx+dz*dz<kSnapPlanarM*kSnapPlanarM && std::abs(dy)<kSnapVerticalM)){reset();return;}
+    if(!g.positionMismatchSince){g.positionMismatchSince=now;return;}
+    if(now-g.positionMismatchSince<kSnapAfterMs || (g.positionAttemptAt && now-g.positionAttemptAt<kSnapRetryMs))return;
+    g.positionAttemptAt=now;
+    if(g.context.actions->reconcileStage(g.context,g.correction))reset();
+}
+// Pass 19 (puppet Alien): while the owner's poses say Crawling (crawl mode or
+// its hatch traversal), an observer moves the replica with the SAME retail
+// crawl path move the owner uses, aimed at the owner pose. The retail path
+// takes the crawlspace hatch link, so the replica plays the hatch climb (18)
+// and the duct crawl instead of gliding through the wall. Its own traversal is
+// never interrupted. More than kCrawlFallbackM behind: hand back to the
+// ordinary owner-pose blend, which closes the gap.
+// Pass 20 (avsfix19 test: the copy kept the crawl posture after the exit): the
+// copy fell > 4 m behind twice (crawlFallback 2) and the blend dragged it out of
+// the duct without its own exit climb. Now 8 m / 2.5 m height, and after the
+// owner's Crawling flag clears the copy keeps the path move toward the owner for
+// up to kCrawlTailMs, so it climbs out through the hatch itself (its own 18).
+constexpr float kCrawlFallbackM=8.0F,kCrawlArriveM=0.4F,kCrawlTailArriveM=0.7F,kCrawlHeightM=2.5F;
+constexpr std::uint64_t kCrawlTailMs=3000U;
+bool MirrorOwnerCrawl(std::uint64_t now) noexcept {
+    const auto stop=[]() noexcept {
+        if(g.crawlMirroring && g.context.actions && g.context.actions->crawl)
+            static_cast<void>(g.context.actions->crawl(g.context,nullptr));
+        g.crawlMirroring=false;g.crawlSeenAt=0U;
+    };
+    const bool crawling=g.correctionAt && Fresh(now,g.correctionAt,400U) &&
+        (g.correction.flags&(PoseValid|Crawling|Backstage))==(PoseValid|Crawling);
+    if(crawling)g.crawlSeenAt=now;
+    const bool tail=!crawling && g.crawlMirroring && g.crawlSeenAt && now-g.crawlSeenAt<kCrawlTailMs &&
+        g.correctionAt && Fresh(now,g.correctionAt,400U) &&
+        (g.correction.flags&(PoseValid|Backstage))==PoseValid;
+    if(g.context.localOwner || !g.context.actions || !g.context.actions->crawl || (!crawling && !tail) ||
+        ActionBusy()){stop();return false;}
+    std::uint8_t state{};bool backstage{};Frame body{};
+    if(!NativeStage(g.context.character,state,backstage) || backstage || !ReadPose(body)){stop();return false;}
+    if(state==18U) {
+        // The replica's own hatch traversal: let retail finish it.
+        g.crawlMirroring=true;g.moving=true;gCrawlHatch.fetch_add(1U,std::memory_order_relaxed);return true;
+    }
+    const float lead=std::min(0.2F,static_cast<float>(now-g.correctionAt)/1000.0F+0.1F);
+    const float dx=g.correction.x+g.correction.velocityX*lead-body.x;
+    const float dz=g.correction.z+g.correction.velocityZ*lead-body.z;
+    const float dist=std::hypot(dx,dz);
+    if(!std::isfinite(dist) || dist>kCrawlFallbackM || std::abs(g.correction.y-body.y)>kCrawlHeightM) {
+        if(g.crawlMirroring)gCrawlFallback.fetch_add(1U,std::memory_order_relaxed);
+        stop();return false;
+    }
+    if(tail && dist<kCrawlTailArriveM) {
+        // Out of the duct and caught up: hand back to the owner-pose blend.
+        gCrawlTailDone.fetch_add(1U,std::memory_order_relaxed);stop();return false;
+    }
+    static_cast<void>(CancelRecovery());ReleaseCarrier();
+    if(g.context.actions->drive)static_cast<void>(g.context.actions->drive(g.context,nullptr));
+    g.crawlMirroring=true;
+    if(tail)gCrawlTail.fetch_add(1U,std::memory_order_relaxed);
+    if(dist<kCrawlArriveM) {
+        static_cast<void>(g.context.actions->crawl(g.context,nullptr));g.moving=false;
+    } else {
+        Frame intent{};intent.forward=1.0F;intent.strafe=0.0F;intent.yaw=std::atan2(dx,dz);intent.gait=1U;
+        g.moving=g.context.actions->crawl(g.context,&intent);
+    }
+    gCrawlMirror.fetch_add(1U,std::memory_order_relaxed);
+    g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();
+    return true;
+}
 void ApplyMovement(std::uint64_t now,float dt) noexcept {
+    RepairObserverStage(now);
+    RepairObserverPosition(now);
     if(!g.context.host && !g.aligned && (g.context.localOwner || !g.correctionAt ||
         (g.correction.flags&OwnerMeasured)==0U)){static_cast<void>(StopDonorMovement());ReleaseCarrier();return;}
     const bool active=g.window.ActiveAt(now) && !g.deliveryFault;
@@ -337,7 +492,19 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
             Fresh(now,g.lastAckAt,kAuthorityTimeoutMs) : g.window.InputFresh(now);
     const bool held=g.context.localOwner && g.local.focused && (g.local.forward!=0.0F || g.local.strafe!=0.0F);
     if(held)gHeld.fetch_add(1U,std::memory_order_relaxed);
-    if(ActionBusy() || g.hasDeferredAction) {
+    // Pass 20: an observer of an owner-measured Alien keeps following the owner
+    // poses while a receipt is still open, unless its replica is really inside
+    // a native action (pair 78/79, vent, traversal) or the owner pose says busy.
+    // avsfix19: after a failed locker kill the survivor PC's receipt stayed open,
+    // the blend never ran again and the copy stood 5 m off for over a minute.
+    bool followThroughBusy=false;
+    if(!g.context.localOwner && (ActionBusy() || g.hasDeferredAction) && g.correctionAt &&
+        Fresh(now,g.correctionAt,250U) &&
+        (g.correction.flags&(PoseValid|OwnerMeasured|NativeBusy))==(PoseValid|OwnerMeasured)) {
+        followThroughBusy=OrdinaryCycle(g.context.character);
+        (followThroughBusy?gBlendThroughBusy:gBlendBlockedBusy).fetch_add(1U,std::memory_order_relaxed);
+    }
+    if((ActionBusy() || g.hasDeferredAction) && !followThroughBusy) {
         float chaseYaw{};
         const int chase=g.hasDeferredAction?0:ChaseState(chaseYaw);
         if(chase!=0 && g.context.localOwner && g.context.actions && g.context.actions->drive) {
@@ -364,10 +531,15 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
     }
     const bool remoteVent=!g.context.localOwner && VentAction(g.ventAuthority) &&
         g.ventAuthority.phase==ActionPhase::Started;
-    if(active && !g.context.localOwner && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
+    if(!remoteVent && !followThroughBusy && MirrorOwnerCrawl(now))return;
+    const bool ownerPose=!g.context.localOwner && g.correctionAt && Fresh(now,g.correctionAt,250U) &&
         (g.correction.flags&(PoseValid|OwnerMeasured))==(PoseValid|OwnerMeasured) &&
         ((g.correction.flags&NativeBusy)==0U || (g.correction.flags&VentAnimating)!=0U) &&
-        g.context.actions && g.context.actions->replicatePose) {
+        g.context.actions && g.context.actions->replicatePose;
+    // Pass 20: a fresh owner-measured pose is itself the proof the pilot is live;
+    // an inactive input window only means the committed input is not usable.
+    if(ownerPose && !active)gBlendInactive.fetch_add(1U,std::memory_order_relaxed);
+    if(ownerPose) {
         Frame body{};if(!ReadPose(body))return;
         auto target=g.correction;
         const float age=std::min(0.05F,static_cast<float>(now-g.correctionAt)/1000.0F);
@@ -379,9 +551,10 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
         target.y=body.y+(target.y-body.y)*alpha;
         if(g.context.actions->drive) {
             const auto& input=g.window.Input();
-            static_cast<void>(g.context.actions->drive(g.context,remoteVent?nullptr:&input));
+            static_cast<void>(g.context.actions->drive(g.context,remoteVent || !active || followThroughBusy?nullptr:&input));
         }
         if(g.context.actions->replicatePose(g.context,target)) {
+            gOwnerBlend.fetch_add(1U,std::memory_order_relaxed);
             g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();
             g.moving=std::hypot(target.velocityX,target.velocityZ)>0.05F;g.aligned=true;
         }
@@ -473,6 +646,18 @@ void ApplyMovement(std::uint64_t now,float dt) noexcept {
                 intent.yaw=std::atan2(vx,vz);intent.forward=1.0F;intent.strafe=0.0F;
             }
         }
+        if(g.context.localOwner && g.context.actions->crawl) {
+            if(input.crawl && input.focused) {
+                // Crawlspace: retail path move (takes the hatch links); the
+                // kind9 direction request is retired while it runs.
+                static_cast<void>(g.context.actions->drive(g.context,nullptr));
+                g.moving=g.context.actions->crawl(g.context,&intent) && (intent.forward!=0.0F || intent.strafe!=0.0F);
+                if(held)(g.moving?gDriven:gDriveRefused).fetch_add(1U,std::memory_order_relaxed);
+                if(g.moving){g.appliedInput=g.window.LastInput();g.appliedHost=g.window.LastHost();}
+                return;
+            }
+            static_cast<void>(g.context.actions->crawl(g.context,nullptr));
+        }
         g.moving=g.context.actions->drive(g.context,input.focused?&intent:nullptr) &&
             (intent.forward!=0.0F || intent.strafe!=0.0F) && input.focused;
         if(held)(g.moving?gDriven:gDriveRefused).fetch_add(1U,std::memory_order_relaxed);
@@ -545,6 +730,9 @@ void PublishInput(std::uint64_t now) noexcept {
     LocalInput queued{};
     if(g.actionCount) {
         queued=g.actions[g.actionRead];frame.action=queued.action;
+        // Round 10: an action carries its own pitch (the flame-retreat marker
+        // on EnterVent); the steering pitch is otherwise always 0.
+        frame.pitch=queued.pitch;
         g.actionRead=(g.actionRead+1U)%g.actions.size();--g.actionCount;
     }
     Frame body{};
@@ -557,7 +745,7 @@ void PublishInput(std::uint64_t now) noexcept {
     }
     Publish(frame,now);gInputs.fetch_add(1U,std::memory_order_relaxed);g.lastInputSent=now;
     if(frame.action==Action::EnterVent || frame.action==Action::ExitVent) {
-        g.ventAuthority=frame;g.ventAuthority.phase=ActionPhase::Preparing;
+        SetVentAuthority(frame,now);g.ventAuthority.phase=ActionPhase::Preparing;
     }
 }
 } // namespace
@@ -592,6 +780,15 @@ bool VentRequestPending() noexcept {
             g.ventAuthority.phase==ActionPhase::Started));
 }
 bool NonVentActionBusy() noexcept {return ActionBusy() && !VentRequestPending();}
+bool PlayReaction(std::uint32_t type,std::uint64_t windowMs) noexcept {
+    return g.context.localOwner && g.context.actions && g.context.actions->react && !ActionBusy() &&
+        g.context.actions->react(g.context,type,windowMs);
+}
+bool TakeStunRoar(float& yaw) noexcept {
+    const auto at=gStunRoarAt.load(std::memory_order_acquire);
+    if(!at || gStunRoarTaken.exchange(at,std::memory_order_acq_rel)==at)return false;
+    yaw=gStunRoarYaw.load(std::memory_order_relaxed);return true;
+}
 void Reset(bool certifiedLivingCharacter) noexcept {
     if(g.context.actions && g.context.actions->cancel)g.context.actions->cancel(g.context,certifiedLivingCharacter);
     if(certifiedLivingCharacter && g.context.character && g.ownsSlot)
@@ -620,11 +817,13 @@ void Pump(const Context& context) noexcept {
         g.inbox.Clear(g.deliveryGeneration<<32U);g.outbox.Clear(g.deliveryGeneration<<32U);
     }
     g.context=context;
+    if(g.context.localOwner && g.context.actions && g.context.actions->react)
+        static_cast<void>(g.context.actions->react(g.context,0U,0U));
     const auto now=GetTickCount64();
     const auto dt=g.lastTick && now>=g.lastTick?
         std::clamp(static_cast<float>(now-g.lastTick)/1000.0F,0.001F,0.05F):0.016F;
     g.lastTick=now;
-    Drain(now);PollAction(now);PublishInput(now);FlushReliable(now);ApplyMovement(now,dt);
+    Drain(now);PollAction(now);ExpireVentAuthority(now);PublishInput(now);FlushReliable(now);ApplyMovement(now,dt);
     if(!g.lastStatus || now-g.lastStatus>=250U) {
         Frame status{};status.kind=Kind::Status;status.sequence=g.deliveryGeneration;status.epoch=g.window.Epoch();status.flags=Flags(now);
         std::uint8_t state{};bool backstage{};
@@ -643,6 +842,10 @@ void Pump(const Context& context) noexcept {
         std::uint8_t state{};bool backstage{};
         const bool known=NativeStage(context.character,state,backstage);
         if(known && backstage)pose.flags|=Backstage;
+        // Pass 19: crawl mode (duct / C window) or the hatch traversal itself.
+        if(context.localOwner && known && !backstage && (g.local.crawl || state==18U) && !ActionBusy()) {
+            pose.flags|=Crawling;gCrawlPosesSent.fetch_add(1U,std::memory_order_relaxed);
+        }
         if(MovementBusy() || !known || (!OrdinaryCycle(context.character) && !spatial::ManualBackstage(state,backstage,false)))pose.flags|=NativeBusy;
         if(context.localOwner && known && backstage && state==18U && ActionBusy() &&
             VentAction(g.ventAuthority) && g.ventAuthority.phase==ActionPhase::Started)
@@ -678,9 +881,13 @@ bool LastCorrection(Frame& frame,std::uint64_t& ageMs) noexcept {
     if(!g.context.owned || g.context.localOwner || !g.correctionAt)return false;
     frame=g.correction;ageMs=GetTickCount64()-g.correctionAt;return true;
 }
+PuppetStats PuppetSnapshot() noexcept {
+    return {gCrawlPosesSent.load(),gCrawlMirror.load(),gCrawlHatch.load(),gOwnerBlend.load(),gCrawlFallback.load(),
+        gCrawlTail.load(),gCrawlTailDone.load(),gBlendThroughBusy.load(),gBlendBlockedBusy.load(),gBlendInactive.load()};
+}
 MovementStats MovementSnapshot() noexcept {
     return {gHeld.load(),gDriven.load(),gBlockedAction.load(),gBlockedVent.load(),gBlockedStale.load(),
-        gBlockedStage.load(),gDriveRefused.load(),gChaseDriven.load()};
+        gBlockedStage.load(),gDriveRefused.load(),gChaseDriven.load(),gVentExpired.load(),gVentEpochCleared.load()};
 }
 Counters Snapshot() noexcept {
     return {gReceived.load(),gRejected.load(),gExpired.load(),gDropped.load(),gInputs.load(),gCommits.load(),

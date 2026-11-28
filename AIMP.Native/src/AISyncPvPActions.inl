@@ -57,6 +57,9 @@ struct Active final {
     std::uint32_t retargets{},flagConsumed{};
     std::uintptr_t attackAnimated{};bool shouldAttackSet{};
     ap::attack::HeldTarget brainTarget{};
+    // Pass 20: first frame the chased victim was in contact while retail still
+    // refused the kill (forced latch after kForcedLatchMs).
+    std::uint64_t contactSince{};
 };
 Active active{};
 policy::EdgeGate edges{};
@@ -168,6 +171,11 @@ struct AttackTelemetry final {
     std::array<std::atomic<std::uint32_t>,16> history{};std::atomic<std::uint32_t> historyWrite{};
     // Session counters (never reset per attack).
     std::atomic<unsigned> ventHijacks{};
+    // Pass 20: attacks refused because the victim hides in a locker/cabinet
+    // (stage 42; the retail grab broke there and left the victim stuck in 79),
+    // forced latches (stage 43: in contact 1.5 s while retail kept refusing, e.g.
+    // a survivor crouched under a closet).
+    std::atomic<unsigned> lockerRefused{},forcedLatches{};
     // Last NoTarget rejection: nearest certified survivor relative to the
     // Alien and the pilot's aim (debug point for "clicking does nothing").
     std::atomic<std::uint64_t> missRevision{},missSequence{};
@@ -283,6 +291,8 @@ void LogAttack(Diagnostics& diagnostics) {
          {"presentTries",Diagnostics::Unsigned(attackTelemetry.presentTries.load()),true},
          {"retries",Diagnostics::Unsigned(attackTelemetry.retries.load()),true},
          {"chaseFrames",Diagnostics::Unsigned(attackTelemetry.chaseFrames.load()),true},
+         {"lockerRefused",Diagnostics::Unsigned(attackTelemetry.lockerRefused.load()),true},
+         {"forcedLatches",Diagnostics::Unsigned(attackTelemetry.forcedLatches.load()),true},
          {"victimGate",Diagnostics::Unsigned(gPairedVictimGateSeen.exchange(0U,std::memory_order_relaxed)),true},
          {"bone",DefinitionBone(),false},
          {"kind",Diagnostics::Unsigned(gDefinitionKind.load(std::memory_order_relaxed)),true},
@@ -363,6 +373,15 @@ std::uintptr_t RetailEntry(std::uintptr_t manager) noexcept {
         return reinterpret_cast<std::uintptr_t(__thiscall*)(void*,int)>(ventEnterOriginal)(reinterpret_cast<void*>(manager),0);
     } AIMP_ACTION_CATCH {return 0;}
 }
+bool RetreatReach(const policy::Point& body,const policy::Point& vent) noexcept {
+    const float dy=vent.y-body.y;
+    return std::hypot(vent.x-body.x,vent.z-body.z)<=ap::fear::kRetreatReach && dy>=-3.0F && dy<=6.0F;
+}
+// Retreat run on this PC (pilot flag) or a Host-side retreat command receipt.
+bool RetreatEntry() noexcept {
+    return active.receipt.action==Action::EnterVent &&
+        (ap::fear::RetreatPitch(active.receipt.pitch) || alien_pvp_local::RetreatActive());
+}
 bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& result) noexcept {
     std::uintptr_t withdraw{},manager{},entries{};std::uint32_t count{};
     if(!Read(c.character+0x34F0U,withdraw) || !withdraw || !Read(withdraw+0x24U,manager) || !manager ||
@@ -371,6 +390,9 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
     policy::Vent best{};bool found{};
     float bestDistance=std::numeric_limits<float>::infinity();
     const bool enter=request.action==Action::EnterVent;
+    // AvS round 10: a flame retreat (pitch marker) may pick a vent up to 25 m
+    // away; the native vent node walks the path there.
+    const bool retreat=enter && ap::fear::RetreatPitch(request.pitch);
     for(std::uint32_t i=0U;i<count;++i) {
         std::uintptr_t descriptor{};policy::Vent vent{};vent.localIndex=i;
         if(!Read(entries+static_cast<std::uintptr_t>(i)*0x30U+0x28U,descriptor) || !descriptor ||
@@ -379,8 +401,8 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
             if((request.flags&ap::VentSelected)!=0U) {
                 constexpr float tolerance=policy::kVentMatchTolerance*policy::kVentMatchTolerance;
                 if(policy::DistanceSquared(vent.entrance,{request.x,request.y,request.z})>tolerance)continue;
-                if(enter && !ap::vents::WithinReach({body.x,body.y,body.z},
-                    {vent.entrance.x,vent.entrance.y,vent.entrance.z}))continue;
+                if(enter && !(retreat?RetreatReach(body,vent.entrance):ap::vents::WithinReach({body.x,body.y,body.z},
+                    {vent.entrance.x,vent.entrance.y,vent.entrance.z})))continue;
                 if(found){result.reason=Reason::AmbiguousVent;return false;}
                 best=vent;found=true;continue;
             }
@@ -412,7 +434,7 @@ bool SelectPortal(const ap::Context& c,const ap::Frame& request,ap::Frame& resul
     // straight-line nearest opening), so this never ran and the Alien was sent
     // ~11 m around a wall to an approach it then could not open. Apply it to
     // every entry; the retail choice must still be within reach of the body.
-    if(c.host && enter && found) {
+    if(c.host && enter && found && !retreat) {
         const auto original=RetailEntry(manager);
         if(original>=entries && (original-entries)%0x30U==0U && (original-entries)/0x30U<count) {
             policy::Vent vent{};std::uintptr_t descriptor{};
@@ -567,6 +589,80 @@ bool StartRecovery(const ap::Context& c,const ap::Frame& goal,RecoverySlot& slot
         // Frame factory supplies ordinary movement flags=2. Unlike a vent
         // request, no flag is changed and no manager lock is manufactured.
         Native<Dispatch>(0x002D0260U)(slot.node.data(),c.character,slot.frame,0U,0U,0U);
+        return true;
+    } AIMP_ACTION_CATCH {slot.quarantined=true;return false;}
+}
+// AvS round 10 crawlspaces: the pilot's kind9 direction move never takes the
+// hatch nav link, so the Alien could walk inside a duct but not get out (log
+// 2026-11-26: three stalls in cycle 56 right after a vent exit). In crawl mode
+// the OWNER drives the same retail path node the recovery uses
+// (ActionMoveToMostRecentSensedPosition, 0030A940) toward a short goal ahead of
+// the input direction; the retail path follower plays the crawl and hatch
+// traversals. Other PCs follow the owner's measured poses as usual.
+RecoverySlot crawlSlot{};
+struct CrawlTelemetry final {
+    std::atomic<std::uint64_t> starts{},moves{},arrived{},failed{},stops{},refused{};
+    std::atomic<int> lastResult{-1};std::atomic<float> lastGoalM{};
+} crawlTelemetry;
+bool StartPathSlot(const ap::Context& c,const policy::Point& goal,std::uint32_t gait,RecoverySlot& slot) noexcept {
+    std::uint32_t allocated{};
+    // Pass 19: observers also drive it (ControlRuntime MirrorOwnerCrawl) so the
+    // replica takes the same hatch links as the owner; the lease must be ours.
+    if(!Live(c) || !c.owned || !gPvPLease.owned || gPvPLease.releasing ||
+        !Read(gBase+0x012B1C20U,allocated) || allocated>=0x6F6U ||
+        !ap::action_abi::Matches(gBase,nullptr,[](void*,std::uintptr_t at,void* out,std::size_t n) noexcept {
+            return crash_guard::TryCopy(out,reinterpret_cast<const void*>(at),n);
+        }))return false;
+    slot.used=true;slot.context=c;
+    slot.node={static_cast<std::uint32_t>(gBase+0x00EB84D0U),0U,std::min(gait,3U)};
+    slot.goal=goal;slot.began=slot.selectedAt=GetTickCount64();slot.steppedAt=0U;
+    AIMP_ACTION_TRY {
+        using Create=std::uintptr_t(__thiscall*)(void*,std::uint32_t,std::uintptr_t);
+        using Dispatch=void(__thiscall*)(void*,std::uintptr_t,std::uintptr_t,std::uint32_t,std::uint32_t,std::uint32_t);
+        slot.frame=Native<Create>(0x002F15C0U)(slot.node.data(),1U,gPvPLease.tree);
+        if(!slot.frame){slot={};return false;}
+        Native<Dispatch>(0x002D0260U)(slot.node.data(),c.character,slot.frame,0U,0U,0U);
+        return true;
+    } AIMP_ACTION_CATCH {slot.quarantined=true;return false;}
+}
+bool Crawl(const ap::Context& c,const ap::Frame* intent) noexcept {
+    auto& slot=crawlSlot;
+    const bool wantStop=!intent || (intent->forward==0.0F && intent->strafe==0.0F);
+    if(wantStop || !Live(c) || gPvPLease.releasing || Same(c)) {
+        if(!slot.used)return true;
+        if(!Live(c)){slot.quarantined=true;return false;}
+        crawlTelemetry.stops.fetch_add(1U,std::memory_order_relaxed);
+        return FinishRecovery(c,slot,true);
+    }
+    if(slot.quarantined){crawlTelemetry.refused.fetch_add(1U,std::memory_order_relaxed);return false;}
+    std::uint8_t state{};bool backstage{};
+    if(!Cycle(c.character,state,backstage) || backstage || state==18U || state==78U || state==79U) {
+        if(slot.used)static_cast<void>(FinishRecovery(c,slot,true));
+        return false;
+    }
+    if(slot.cancelling)return !FinishRecovery(c,slot,true);
+    policy::Point body{};if(!Body(c.character,body))return false;
+    const float yaw=intent->yaw+std::atan2(intent->strafe,intent->forward);
+    const auto now=GetTickCount64();
+    // Alternate the goal distance after a failed plan (wall right ahead).
+    const float reach=(crawlTelemetry.failed.load(std::memory_order_relaxed)&1U)?1.2F:2.4F;
+    const policy::Point goal{body.x+std::sin(yaw)*reach,body.y,body.z+std::cos(yaw)*reach};
+    if(!slot.used) {
+        if(!StartPathSlot(c,goal,1U,slot))return false;
+        crawlTelemetry.starts.fetch_add(1U,std::memory_order_relaxed);
+    }
+    if(!RecoveryLive(c,slot)){slot.quarantined=true;return false;}
+    if(now-slot.selectedAt>=150U){slot.goal=goal;slot.selectedAt=now;}
+    if(slot.steppedAt && now-slot.steppedAt<33U)return true;
+    slot.steppedAt=now;
+    crawlTelemetry.lastGoalM.store(reach,std::memory_order_relaxed);
+    AIMP_ACTION_TRY {
+        using Move=int(__thiscall*)(void*,std::uintptr_t,std::uintptr_t,const void*,std::uint32_t,float,float,std::uint32_t);
+        const auto result=Native<Move>(0x0030A940U)(slot.node.data(),c.character,slot.frame,&slot.goal,0U,0.0F,0.3F,0U);
+        crawlTelemetry.moves.fetch_add(1U,std::memory_order_relaxed);
+        crawlTelemetry.lastResult.store(result,std::memory_order_relaxed);
+        if(result==1){crawlTelemetry.arrived.fetch_add(1U,std::memory_order_relaxed);static_cast<void>(FinishRecovery(c,slot,false));}
+        else if(result!=0){crawlTelemetry.failed.fetch_add(1U,std::memory_order_relaxed);static_cast<void>(FinishRecovery(c,slot,true));}
         return true;
     } AIMP_ACTION_CATCH {slot.quarantined=true;return false;}
 }
@@ -811,6 +907,18 @@ bool VictimInLeash(const ap::Context& c,const PairIdentity& victim) noexcept {
     if(!Body(c.character,source) || !Body(victim.character,target))return false;
     return std::abs(target.y-source.y)<=policy::kAttackHeight &&
         std::hypot(target.x-source.x,target.z-source.z)<=policy::kAttackLeash;
+}
+// Pass 20: close enough that only retail's room/cover check can still refuse
+// the kill (survivor crouched under furniture right next to the Alien).
+constexpr float kForcedContactM=1.4F,kForcedContactHeightM=1.0F;
+constexpr std::uint64_t kForcedLatchMs=1500U;
+constexpr std::uint32_t kForcedSelector=0U; // standard front grab (kills seen with selector 0)
+bool VictimInContact(const ap::Context& c,const PairIdentity& victim) noexcept {
+    if(!PairIdentityLive(victim) || !LivingCharacter(victim.character))return false;
+    policy::Point source{},target{};
+    if(!Body(c.character,source) || !Body(victim.character,target))return false;
+    return std::abs(target.y-source.y)<=kForcedContactHeightM &&
+        std::hypot(target.x-source.x,target.z-source.z)<=kForcedContactM;
 }
 // The victim is in ITS paired cycle (79) of this Alien's pair: the kill grabbed it.
 bool VictimInPair(const std::uintptr_t source,const std::uintptr_t victim) noexcept {
@@ -1295,7 +1403,13 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 TraceAttack(40U,active.receipt.selector);
                 Terminal(result,Phase::Rejected,Reason::NoTarget);active.cancelled=true;return true;
             }
-            if(!player_hiding::PreparePvPSearch(active.victim.character,c.scope.nativeGeneration)) {
+            // Pass 20 (avsfix19 locker kill): a survivor inside a locker/cabinet
+            // is not killable by the paired grab. The retail search pair entered
+            // 78 for one frame and dropped, the victim replica stayed in 79
+            // (invisible after the exit) and the survivor PC froze its Alien copy.
+            // Lockers get their own sniff/hold-breath kill (next pass).
+            if(player_hiding::Hidden(active.victim.character)) {
+                attackTelemetry.lockerRefused.fetch_add(1U,std::memory_order_relaxed);TraceAttack(42U);
                 Terminal(result,Phase::Rejected,Reason::NotReady);active.cancelled=true;return true;
             }
             // One explicit query proves the native attack is available on THIS
@@ -1306,7 +1420,20 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
                 if(!AttackAvailability(c,active.victim,active.chooser,ready,selector)) {
                     Terminal(result,Phase::Failed,Reason::NativeUnavailable);active.cancelled=true;return true;
                 }
-                if(ready){active.attackLatched=true;active.latchedAt=now;active.receipt.selector=selector;}
+                if(ready){active.attackLatched=true;active.latchedAt=now;active.receipt.selector=selector;active.contactSince=0U;}
+                else if(VictimInContact(c,active.victim)) {
+                    // Pass 20 (avsfix19: 26 s chase 0.6 m from a survivor crouched
+                    // under a closet, availability 0 the whole time): retail
+                    // refuses every kill there (no room / cover ray). After 1.5 s
+                    // in contact submit the standard front grab anyway; the pair
+                    // alignment pulls the victim out to the Alien.
+                    if(!active.contactSince)active.contactSince=now;
+                    if(now-active.contactSince>=kForcedLatchMs) {
+                        active.attackLatched=true;active.latchedAt=now;active.receipt.selector=kForcedSelector;
+                        attackTelemetry.forcedLatches.fetch_add(1U,std::memory_order_relaxed);
+                        TraceAttack(43U,kForcedSelector);
+                    }
+                } else active.contactSince=0U;
             }
             if(active.attackLatched) {
 #ifndef AIMP_ALIEN_ACTION_TEST
@@ -1419,7 +1546,7 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         // wrong-side approach ("the Alien started running around"). Give the
         // pilot control back at once instead of after the 10 s window.
         if(active.receipt.action==Action::EnterVent && !Protected(state) && std::isfinite(active.ventBestDistance) &&
-            distance>active.ventBestDistance+2.5F) {
+            distance>active.ventBestDistance+(RetreatEntry()?10.0F:2.5F)) {
             TraceVent(5U);
             Terminal(result,Phase::Failed,Reason::NoVent);
             Cancel(c,true);return true;
@@ -1435,9 +1562,10 @@ bool Poll(const ap::Context& c,ap::Frame& result) noexcept {
         Terminal(result,Phase::Failed,Reason::Timeout);
         Cancel(c,true);return true;
     }
-    const auto traversalLimit=active.receipt.action==Action::EnterVent?10000U:25000U;
+    const bool retreating=RetreatEntry();
+    const auto traversalLimit=active.receipt.action==Action::EnterVent?(retreating?20000U:10000U):25000U;
     const bool stalled=active.receipt.action==Action::EnterVent && !Protected(state) &&
-        !active.moveArrived && now-active.ventProgressAt>5000U;
+        !active.moveArrived && now-active.ventProgressAt>(retreating?8000U:5000U);
     if(nativeResult==2 || stalled || now-active.began>traversalLimit) {
         Terminal(result,Phase::Failed,nativeResult==2?Reason::NativeRefused:Reason::Timeout);
         Cancel(c,true);return true;
@@ -1477,6 +1605,12 @@ bool ReplicatePose(const ap::Context& c,const ap::Frame& pose) noexcept {
     if((pose.flags&ap::VentAnimating)!=0U)return false;
     return ReplicatePvPPose(c,pose);
 }
+// Pass 15: stage repair for an observer of a Host-piloted Alien. A local
+// (non-remote) action owns its own stage transitions.
+bool ReconcileStage(const ap::Context& c,const ap::Frame& pose) noexcept {
+    if(Same(c) && !active.remoteVent)return false;
+    return ReconcilePvPReplicaStage(c,pose);
+}
 #endif
 void RetirePending() noexcept {
 #ifndef AIMP_ALIEN_ACTION_TEST
@@ -1511,11 +1645,18 @@ int Chase(const ap::Context& c,float& yaw) noexcept {
 #endif
     return 1;
 }
+// ActionHooks::react: type 0 pumps (retires an expired reaction).
+bool React(const ap::Context& c,std::uint32_t type,std::uint64_t windowMs) noexcept {
+    if(type==0U)return PumpReaction(c);
+    // Never during a vent/attack/pair this module owns.
+    if(Same(c))return false;
+    return PlayReaction(c,type,windowMs);
+}
 const ap::ActionHooks hooks{&Begin,&Poll,&Busy,&Cancel,&Recover,&CancelRecovery
 #ifndef AIMP_ALIEN_ACTION_TEST
-    ,&DriveDonor,&ReplicatePose,&InterruptVent,&Chase
+    ,&DriveDonor,&ReplicatePose,&InterruptVent,&Chase,&Crawl,&React,&ReconcileStage
 #else
-    ,nullptr,nullptr,&InterruptVent,&Chase
+    ,nullptr,nullptr,&InterruptVent,&Chase,&Crawl,&React,nullptr
 #endif
 };
 #undef AIMP_ACTION_TRY

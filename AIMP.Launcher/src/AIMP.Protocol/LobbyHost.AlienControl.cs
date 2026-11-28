@@ -116,7 +116,14 @@ public sealed partial class LobbyHost
             await PublishAlienLeaseAsync(changed,token).ConfigureAwait(false);
             if(!admitted)return;
             AlienControlPoseReceived?.Invoke(this,pose);
-            await BroadcastAsync(MessageType.AlienControlPose,JsonPayload.Serialize(pose),token).ConfigureAwait(false);
+            // AvS pass 19: when the Host itself pilots the Alien, its physical pose
+            // IS the owner's measurement. Mark it so survivor PCs run the owner
+            // presentation (committed input + per-frame pose blend, vent replay)
+            // instead of generic AI routing. The local event keeps the raw pose.
+            bool hostPilot;
+            lock(_stateLock) hostPilot=_alienPeerId==HostPeerId;
+            var outgoing=hostPilot?pose with {OwnerMeasured=true}:pose;
+            await BroadcastAsync(MessageType.AlienControlPose,JsonPayload.Serialize(outgoing),token).ConfigureAwait(false);
         }
         finally{_alienControlDispatchGate.Release();}
     }

@@ -19,9 +19,11 @@ enum Flag : std::uint32_t {
     Bound=1U, LocalOwner=2U, PilotReady=4U, Focused=8U, Host=16U,
     Moving=32U, NativeBusy=64U, Active=128U, Expired=256U,
     UnsupportedAction=512U, PoseValid=1024U, ActionApplied=2048U, Backstage=4096U, VentSelected=8192U, OwnerMeasured=16384U,
-    VentAnimating=32768U
+    VentAnimating=32768U,
+    // AvS pass 19: pilot in crawl mode or its crawlspace hatch traversal (18).
+    Crawling=65536U
 };
-inline constexpr std::uint32_t kKnownFlags=65535U;
+inline constexpr std::uint32_t kKnownFlags=131071U;
 enum class Action : std::uint32_t { None, Attack, EnterVent, ExitVent, Roar, CancelVent };
 enum class ActionPhase : std::uint32_t { None, Started, Completed, Rejected, Failed, Cancelled, Preparing };
 enum class ActionReason : std::uint32_t { None, NativeBusy, Cooldown, NoTarget, NotReady,

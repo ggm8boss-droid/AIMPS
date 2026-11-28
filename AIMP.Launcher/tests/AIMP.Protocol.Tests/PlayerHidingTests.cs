@@ -155,11 +155,24 @@ internal static class PlayerHidingTests
         track.MarkCommand(reconciled, Now);
         track.TryAccept(Position(3, Visible), Now);
         Complete();
-        track.TryAccept(Position(4, Hidden), Now);
+        // A settled locker hide (hidden flag + Tall presentation).
+        var inLocker = Hidden with { Presentation = entering with { Phase = PlayerHidingPhase.Hidden, Transition = 2 } };
+        track.TryAccept(Position(4, inLocker), Now);
         track.TryAccept(Position(5, null), Now); // unavailable samples preserve occupancy
         var enter = RemoteMovementPlanner.Create(track.Snapshot()!, Now);
         AssertEx.Equal(RemoteMovementAction.Stop, enter.Action);
-        AssertEx.Equal(Hidden, enter.Hiding!);
+        AssertEx.Equal(inLocker, enter.Hiding!);
+        // AvS pass 17: the hidden flag WITHOUT a presentation (crouched under a
+        // table) is sent as visible, keeps the torch, and keeps walking.
+        var open = RemoteMovementCommandFactory.Create(0x200000, enter with { Hiding = Hidden });
+        AssertEx.Equal("0", open["playerHiding"]);
+        AssertEx.Equal("0", open["playerHidingPresentation"]);
+        var openTrack = new RemotePositionTrack();
+        openTrack.TryAccept(Position(1, Visible), Now);
+        openTrack.BindCharacter(0x400000);
+        openTrack.TryAccept(Position(2, Hidden), Now.AddMilliseconds(50));
+        AssertEx.True(RemoteMovementPlanner.Create(openTrack.Snapshot()!, Now.AddMilliseconds(60)).Action
+            != RemoteMovementAction.Stop);
         var arguments = RemoteMovementCommandFactory.Create(0x200000, enter);
         var command = new GameCommandExecutePayload(1, Guid.NewGuid(), 1, Guid.NewGuid(),
             GameCommandNames.CharacterDirectMove, arguments);

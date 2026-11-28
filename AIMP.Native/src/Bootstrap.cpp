@@ -55,6 +55,7 @@
 #include "aimp/ReplicationCore.h"
 #include "aimp/WorldEntityRegistry.h"
 #include "aimp/HidingDoorPresentation.h"
+#include "aimp/AlienPvPDoors.h"
 #include "aimp/WorldInteractionAdapters.h"
 #include "aimp/WorldAnimatedAdapters.h"
 #include "aimp/WorldPublicActions.h"
@@ -850,6 +851,9 @@ DWORD Bootstrap::RunImpl() {
         std::string hidingPresentationError;
         if (!hiding_door_presentation::Initialize(*resolver, *worldRegistry, hidingPresentationError))
             diagnostics.Log("warning", "hiding_door_presentation_rejected", hidingPresentationError);
+        std::string pvpDoorsError;
+        if (!alien_pvp_doors::Initialize(*resolver, *worldRegistry, pvpDoorsError))
+            diagnostics.Log("warning", "alien_pvp_doors_rejected", pvpDoorsError);
         if (world_animated::Initialize(
                 *resolver, *hooks, *worldRegistry, animatedAdapterError)) {
             diagnostics.Log(
@@ -1687,6 +1691,7 @@ DWORD Bootstrap::RunImpl() {
     world_interactions::BeginLogicalShutdown();
     world_animated::BeginLogicalShutdown();
     hiding_door_presentation::BeginLogicalShutdown();
+    alien_pvp_doors::Shutdown();
     replication_core::BeginLogicalShutdown();
     cathode_primitives::BeginLogicalShutdown();
     if (spawnTracker != nullptr) {

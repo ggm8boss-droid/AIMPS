@@ -349,7 +349,10 @@ internal static class RemoteMovementPlanner
         var age = now - track.ReceivedAtUtc;
         if (age > SnapshotTimeout) return StalePlan(track);
         // A hidden representation is backstage at the locker; never walk it.
-        if (track.Hiding is { Hidden: true } or { Presentation: not null }) return IdlePlan(track, now);
+        // AvS pass 17: hidden WITHOUT a locker/cabinet presentation = crouched
+        // under a table or closet (retail PLAYER_HIDING, no door). The body stays
+        // visible natively and keeps following the owner.
+        if (track.Hiding is { Presentation: not null }) return IdlePlan(track, now);
         if (track.Previous is null || !track.ObservedMoving) return IdlePlan(track, now);
         var velocityLength = Length(track.EstimatedVelocityX, track.EstimatedVelocityZ);
         if (velocityLength <= float.Epsilon) return IdlePlan(track, now);
@@ -478,6 +481,11 @@ internal static class RemoteMovementCommandFactory
         PlayerTorchSnapshot? torch, PlayerHidingSnapshot? hiding, bool animate, PlayerAnimationSnapshot? animation)
     {
         if (posture is null && torch is null && hiding is null && animation is null) return arguments;
+        // AvS pass 17: retail PLAYER_HIDING also rises when the owner crouches
+        // under a table or closet. With no locker/cabinet presentation the body is
+        // in plain sight: send it as visible so the remote PC neither conceals nor
+        // parks it (the Alien saw nothing and its kill was refused as NotReady).
+        if (hiding is { Hidden: true, Presentation: null }) hiding = new PlayerHidingSnapshot(false);
         // The remote torch uses a separate render entity. Concealing the body
         // alone must not leave a floating beam while an off sample is delayed.
         if (hiding is { Hidden: true } or { Presentation: not null }) torch = new PlayerTorchSnapshot(false);

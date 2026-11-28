@@ -11,7 +11,7 @@ public sealed record AlienControlLease(Guid SessionId,int LevelGeneration,ulong 
 public sealed record AlienControlPose(Guid SessionId,int LevelGeneration,ulong AlienPeerId,
     ulong Epoch,ulong Sequence,ulong HostSequence,ulong AcknowledgedInput,uint EntityA,uint EntityB,
     float X,float Y,float Z,float Yaw,float VelocityX,float VelocityZ,uint Gait,bool NativeBusy,bool Backstage=false,bool OwnerMeasured=false,
-    bool VentAnimating=false);
+    bool VentAnimating=false,bool Crawling=false);
 
 public static class AlienControlAuthorityValidation
 {
